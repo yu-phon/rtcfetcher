@@ -1,0 +1,1 @@
+export const protocolFetchRequest = "rtcfetcherreq" as const;
