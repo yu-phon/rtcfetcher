@@ -3,5 +3,12 @@ export class RTCFetcher {
 
     constructor(peerConnection: RTCPeerConnection) {
         this.peerConnection = peerConnection;
+        this.peerConnection.addEventListener("datachannel", (evt) =>{
+            
+        });
+    }
+
+    fetch(){
+
     }
 }
