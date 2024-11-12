@@ -1,11 +1,12 @@
-export const protocolFetchResponse = "rtcfetcherres" as const;
+import { readyMessage } from "./messages";
 
-function parseRes(header: JSON): RTCFetchResponse {
-    
-    return new RTCFetchResponse();
-}
+export const protocolFetchResponse = "rtcfetcherresponse" as const;
 
 export class RTCFetchResponse {
-
-    content: Blob | String | ReadableStream;
+    headers: Headers;
+    body: ReadableStream | null;
+    id: string;
+    constructor(){
+    }
 }
+
