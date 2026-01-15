@@ -1,0 +1,9 @@
+{
+    "name": "rtcfetcher-browser-example",
+    "version": "1.0.0",
+    "description": "Browser example for RTCFetcher",
+    "scripts": {
+        "test": "node ../../node_modules/vite/bin/vite.js"
+    },
+    "private": true
+}
