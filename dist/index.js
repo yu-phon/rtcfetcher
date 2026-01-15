@@ -88,20 +88,21 @@ var _Negotiator = class _Negotiator {
   async reserveId(label) {
     let attempts = 0;
     const maxAttempts = 5;
+    const excludedIds = /* @__PURE__ */ new Set();
     while (attempts < maxAttempts) {
       attempts++;
-      const candidateId = await this.findUnusedId();
+      const candidateId = await this.findUnusedId(excludedIds);
       try {
-        await this.performHandshake(candidateId);
+        await this.performHandshake(candidateId, label);
         return candidateId;
       } catch (error) {
-        console.warn(`ID reservation failed for ${candidateId}, retrying...`, error);
+        excludedIds.add(candidateId);
         continue;
       }
     }
     throw new RTCFetcherError("Failed to negotiate DataChannel ID after multiple attempts", "NEGOTIATION_FAILED");
   }
-  async performHandshake(id) {
+  async performHandshake(id, label) {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pendingReservations.delete(id);
@@ -117,18 +118,27 @@ var _Negotiator = class _Negotiator {
           reject(err);
         }
       });
-      this.send({ type: "RESERVE", id });
+      this.send({ type: "RESERVE", id, label });
     });
   }
   async handleReserveRequest(message) {
     const id = message.id;
-    const isUsed = await this.isIdUsed(id);
+    let isUsed = await this.isIdUsed(id);
+    let probeChannel;
+    if (!isUsed) {
+      try {
+        probeChannel = this.pc.createDataChannel("probe", { negotiated: true, id });
+      } catch (e) {
+        console.warn(`ID ${id} probing failed, marking as used.`, e);
+        isUsed = true;
+      }
+    }
     if (isUsed) {
       this.send({ type: "NACK", id });
     } else {
       this.send({ type: "ACK", id });
       if (this.onReserved) {
-        this.onReserved(id);
+        this.onReserved(id, probeChannel, message.label);
       }
     }
   }
@@ -175,13 +185,15 @@ var _Negotiator = class _Negotiator {
       console.warn("Signaling channel is not open, cannot send message", message);
     }
   }
-  async findUnusedId() {
+  async findUnusedId(excludedIds) {
     const usedIds = await this.getUsedIds();
+    const sctp = this.pc.sctp;
+    const max = sctp?.maxChannels ?? sctp?.maxDataChannels;
+    const limit = max && max > 0 ? max : 256;
     let candidate = -1;
-    for (let i = 0; i < 100; i++) {
-      const rand = Math.floor(Math.random() * _Negotiator.MAX_CHANNEL_ID);
-      if (rand !== _Negotiator.SIGNALING_CHANNEL_ID && !usedIds.has(rand)) {
-        candidate = rand;
+    for (let i = 1; i < limit; i++) {
+      if (i !== _Negotiator.SIGNALING_CHANNEL_ID && !usedIds.has(i) && !excludedIds?.has(i)) {
+        candidate = i;
         break;
       }
     }
@@ -206,7 +218,7 @@ var _Negotiator = class _Negotiator {
     return usedIds;
   }
 };
-_Negotiator.SIGNALING_CHANNEL_ID = 255;
+_Negotiator.SIGNALING_CHANNEL_ID = 0;
 _Negotiator.MAX_CHANNEL_ID = 65534;
 var Negotiator = _Negotiator;
 
@@ -220,26 +232,57 @@ var SendStream = class {
       close: () => channel.close(),
       abort: () => channel.close()
     });
-    this.writer = this.stream.getWriter();
   }
   get writable() {
     return this.stream;
   }
   async write(data) {
+    if (!this.writer) {
+      this.writer = this.stream.getWriter();
+    }
     return this.writer.write(data);
   }
   async close() {
+    if (!this.writer) {
+      if (this.stream.locked) {
+        return;
+      }
+      this.writer = this.stream.getWriter();
+    }
     return this.writer.close();
   }
   async writeChunk(chunk) {
     if (this.channel.readyState !== "open") {
-      throw new Error("DataChannel is not open");
+      await new Promise((resolve, reject) => {
+        if (this.channel.readyState === "open") return resolve();
+        const onOpen = () => {
+          cleanup();
+          resolve();
+        };
+        const onError = (_e) => {
+          cleanup();
+          reject(new Error("DataChannel error during wait for open"));
+        };
+        const onClose = () => {
+          cleanup();
+          reject(new Error("DataChannel closed before open"));
+        };
+        const cleanup = () => {
+          this.channel.removeEventListener("open", onOpen);
+          this.channel.removeEventListener("error", onError);
+          this.channel.removeEventListener("close", onClose);
+        };
+        this.channel.addEventListener("open", onOpen);
+        this.channel.addEventListener("error", onError);
+        this.channel.addEventListener("close", onClose);
+      });
     }
     if (this.channel.bufferedAmount > this.highWaterMark) {
       await this.waitForBufferedAmountLow();
     }
     try {
       this.channel.send(chunk);
+      console.log("chunk sent");
     } catch (error) {
       console.error("SendStream failed to send:", error);
       throw error;
@@ -263,6 +306,7 @@ var ReceiveStream = class {
     this.stream = new ReadableStream({
       start: (controller) => {
         this.channel.onmessage = (event) => {
+          console.log("channel message");
           if (event.data instanceof ArrayBuffer) {
             controller.enqueue(new Uint8Array(event.data));
           } else if (event.data instanceof Uint8Array) {
@@ -270,8 +314,12 @@ var ReceiveStream = class {
           } else {
           }
         };
-        this.channel.onclose = () => controller.close();
+        this.channel.onclose = () => {
+          console.log("channel close");
+          controller.close();
+        };
         this.channel.onerror = (err) => controller.error(err);
+        this.channel.onopen = () => console.log("channel open");
       },
       cancel: () => {
         this.channel.close();
@@ -406,15 +454,17 @@ var RTCResponse = class {
 var RTCFetcher = class {
   constructor(pc, config) {
     this.pc = pc;
+    // Cache reserved channels (streams) to avoid collisions
+    this.reservedChannels = /* @__PURE__ */ new Map();
     this.config = config || {};
-    this.masterChannel = pc.createDataChannel("rtc-fetcher-master", { negotiated: true, id: 255 });
+    this.masterChannel = pc.createDataChannel("rtc-fetcher-master", { negotiated: true, id: 0 });
     this.negotiator = new Negotiator(this.masterChannel, pc);
     this.incomingRequests = new ReadableStream({
       start: (controller) => {
         this.incomingRequestsController = controller;
       }
     });
-    this.negotiator.onReserved = (id) => this.handleReservedChannel(id);
+    this.negotiator.onReserved = (id, channel, label) => this.handleReservedChannel(id, channel, label);
     this.opened = new Promise((resolve) => {
       const checkOpen = () => {
         if (this.masterChannel.readyState === "open") {
@@ -428,13 +478,18 @@ var RTCFetcher = class {
       }
     });
   }
-  get closed() {
-    return new Promise((resolve) => {
-    });
-  }
-  handleReservedChannel(id) {
+  // ...
+  handleReservedChannel(id, existingChannel, label) {
     try {
-      const channel = this.pc.createDataChannel("rtc-fetcher-req", { negotiated: true, id });
+      if (label && (label === "stream" || label === "res-stream")) {
+        if (existingChannel) {
+          this.reservedChannels.set(id, existingChannel);
+        }
+        return;
+      }
+      console.log("Reserved ID:", id);
+      const channel = existingChannel || this.pc.createDataChannel("rtc-fetcher-req", { negotiated: true, id });
+      console.log("Created/Reused channel:", channel.id);
       const receiveStream = new ReceiveStream(channel);
       this.processIncomingMessage(receiveStream.readable, channel);
     } catch (e) {
@@ -465,7 +520,7 @@ var RTCFetcher = class {
           }
         };
       },
-      reject: (reason) => {
+      reject: (_reason) => {
         channel.close();
       }
     };
@@ -513,6 +568,11 @@ var RTCFetcher = class {
     return obj;
   }
   getOrOpenChannel(id) {
+    if (this.reservedChannels.has(id)) {
+      const channel = this.reservedChannels.get(id);
+      this.reservedChannels.delete(id);
+      return channel;
+    }
     return this.pc.createDataChannel("stream", { negotiated: true, id });
   }
   async bufferAndDecode(stream) {
@@ -547,17 +607,42 @@ var RTCFetcher = class {
     return null;
   }
   // FETCH METHOD IMPLEMENTATION REVISITED
-  async fetch(label, body, options) {
+  async fetch(label, body, _options) {
     await this.opened;
     const reservedId = await this.negotiator.reserveId("req::" + label);
+    console.log("Reserved ID:", reservedId);
     const streams = /* @__PURE__ */ new Map();
+    const streamCache = /* @__PURE__ */ new Map();
     const processedBody = await this.traverseAndExtractStreams(body, async (stream) => {
+      if (streamCache.has(stream)) {
+        return streamCache.get(stream);
+      }
       const streamId = await this.negotiator.reserveId("stream");
       streams.set(streamId, stream);
-      return new StreamRef(streamId);
+      const ref = new StreamRef(streamId);
+      streamCache.set(stream, ref);
+      return ref;
     });
     const encoded = msgpackCodec.encode({ label, body: processedBody });
     const mainChannel = this.pc.createDataChannel(label, { negotiated: true, id: reservedId });
+    if (mainChannel.readyState !== "open") {
+      await new Promise((resolve, reject) => {
+        const onOpen = () => {
+          cleanup();
+          resolve();
+        };
+        const onError = (_e) => {
+          cleanup();
+          reject(new Error("DataChannel error while waiting for open"));
+        };
+        const cleanup = () => {
+          mainChannel.removeEventListener("open", onOpen);
+          mainChannel.removeEventListener("error", onError);
+        };
+        mainChannel.addEventListener("open", onOpen);
+        mainChannel.addEventListener("error", onError);
+      });
+    }
     const sendStream = new SendStream(mainChannel, this.config.minBufferSize);
     streams.forEach((stream, id) => {
       const channel = this.pc.createDataChannel("stream", { negotiated: true, id });

@@ -1,5 +1,5 @@
 import { Negotiator } from '../../negotiation/id-negotiator';
-import { RTCTimeoutError, RTCConnectionError } from '../errors/rtc-fetcher-error';
+
 import { SendStream } from '../../datachannelstream/streams/sendStream';
 import { ReceiveStream } from '../../datachannelstream/streams/receiveStream';
 import { msgpackCodec } from '../utils/msgpack-codec';
@@ -147,7 +147,7 @@ export class RTCFetcher {
                     }
                 };
             },
-            reject: (reason) => {
+            reject: (_reason) => {
                 channel.close();
             }
         };
@@ -299,6 +299,7 @@ export class RTCFetcher {
         let totalLen = 0;
 
         try {
+            // eslint-disable-next-line no-constant-condition
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
@@ -344,7 +345,7 @@ export class RTCFetcher {
     }
 
     // FETCH METHOD IMPLEMENTATION REVISITED
-    public async fetch(label: string, body: any, options?: RTCFetchOptions): Promise<RTCResponse> {
+    public async fetch(label: string, body: any, _options?: RTCFetchOptions): Promise<RTCResponse> {
         await this.opened;
         const reservedId = await this.negotiator.reserveId('req::' + label); // Tag as request
         console.log("Reserved ID:", reservedId);
@@ -373,7 +374,7 @@ export class RTCFetcher {
                     cleanup();
                     resolve();
                 };
-                const onError = (e: Event) => {
+                const onError = (_e: Event) => {
                     cleanup();
                     reject(new Error('DataChannel error while waiting for open'));
                 };
@@ -446,6 +447,7 @@ export class RTCFetcher {
 
             (async () => {
                 try {
+                    // eslint-disable-next-line no-constant-condition
                     while (true) {
                         const { done, value } = await reader.read();
                         if (value) chunks.push(value);

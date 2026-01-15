@@ -39,15 +39,15 @@ declare class RTCFetcher {
     readonly incomingRequests: ReadableStream<IncomingRequest>;
     private incomingRequestsController?;
     readonly opened: Promise<void>;
+    private reservedChannels;
     constructor(pc: RTCPeerConnection, config?: RTCFetcherConfig);
-    get closed(): Promise<void>;
     private handleReservedChannel;
     private processIncomingMessage;
     private sendResponse;
     private processedIncomingBody;
     private getOrOpenChannel;
     private bufferAndDecode;
-    fetch(label: string, body: any, options?: RTCFetchOptions): Promise<RTCResponse>;
+    fetch(label: string, body: any, _options?: RTCFetchOptions): Promise<RTCResponse>;
     private traverseAndExtractStreams;
 }
 
@@ -57,7 +57,7 @@ declare class Negotiator {
     private static readonly SIGNALING_CHANNEL_ID;
     private static readonly MAX_CHANNEL_ID;
     private pendingReservations;
-    onReserved?: (id: number) => void;
+    onReserved?: (id: number, channel?: RTCDataChannel, label?: string) => void;
     constructor(signalingChannel: RTCDataChannel, pc: RTCPeerConnection);
     /**
      * Reserve a new DataChannel ID.
@@ -94,7 +94,7 @@ declare class SendStream {
     private readonly channel;
     private readonly highWaterMark;
     private readonly stream;
-    private readonly writer;
+    private writer?;
     constructor(channel: RTCDataChannel, highWaterMark?: number);
     get writable(): WritableStream<Uint8Array>;
     write(data: Uint8Array): Promise<void>;

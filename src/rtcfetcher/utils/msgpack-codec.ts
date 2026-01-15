@@ -1,5 +1,5 @@
 import { encode, decode, ExtensionCodec } from '@msgpack/msgpack';
-import { RTCFetcherError, RTCSerializationError } from '../errors/rtc-fetcher-error';
+import { RTCSerializationError } from '../errors/rtc-fetcher-error';
 import { StreamRef } from '../types/stream-ref';
 
 // ExtensionTypeの定義

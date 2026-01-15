@@ -47,7 +47,7 @@ export class SendStream {
                     cleanup();
                     resolve();
                 };
-                const onError = (e: Event) => {
+                const onError = (_e: Event) => {
                     cleanup();
                     reject(new Error('DataChannel error during wait for open'));
                 };

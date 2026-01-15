@@ -1,7 +1,4 @@
-import { msgpackCodec } from '../utils/msgpack-codec';
-import { ReceiveStream } from '../../datachannelstream/streams/receiveStream';
 import { StreamRef } from '../types/stream-ref';
-import { RTCSerializationError } from '../errors/rtc-fetcher-error';
 
 export class RTCResponse {
     private _body: any;

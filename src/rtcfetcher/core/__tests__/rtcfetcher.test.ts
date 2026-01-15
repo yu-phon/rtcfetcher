@@ -1,6 +1,5 @@
 import { RTCFetcher } from '../rtcfetcher';
-import { RTCResponse } from '../rtc-response';
-import { SendStream } from '../../../datachannelstream/streams/sendStream';
+
 
 jest.mock('../../../datachannelstream/streams/sendStream');
 jest.mock('../../../datachannelstream/streams/receiveStream');
