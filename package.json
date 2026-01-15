@@ -1,11 +1,54 @@
 {
   "name": "@yuphon/rtcfetcher",
   "version": "1.0.0",
-  "description": "WebRTC Fetch API",
-  "main": "index.js",
+  "description": "WebRTC Fetch API implementation",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "tsup src/index.ts --format cjs,esm --dts --clean",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+    "test": "jest",
+    "lint": "eslint src --ext .ts",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm test && npm run lint",
+    "demo": "vite"
   },
   "author": "yuphon",
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.11.28",
+    "@typescript-eslint/eslint-plugin": "^7.2.0",
+    "@typescript-eslint/parser": "^7.2.0",
+    "eslint": "^8.57.0",
+    "jest": "^29.7.0",
+    "jest-environment-jsdom": "^29.7.0",
+    "prettier": "^3.2.5",
+    "ts-jest": "^29.1.2",
+    "tsup": "^8.0.2",
+    "typescript": "^5.4.2",
+    "vite": "^7.3.1",
+    "web-streams-polyfill": "^4.1.0"
+  },
+  "peerDependencies": {
+    "typescript": ">=4.0.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "keywords": [
+    "webrtc",
+    "fetch",
+    "p2p",
+    "datachannel",
+    "typescript"
+  ],
+  "dependencies": {
+    "@msgpack/msgpack": "^3.1.1"
+  }
 }

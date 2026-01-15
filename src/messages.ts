@@ -1,1 +1,0 @@
-export const readyMessage = "ready" as const;
