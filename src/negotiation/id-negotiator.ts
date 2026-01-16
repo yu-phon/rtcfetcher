@@ -6,6 +6,9 @@ export class Negotiator {
     private static readonly MAX_CHANNEL_ID = 65534; // SCTP limit 65535, 255 reserved
 
     private pendingReservations: Map<number, { resolve: () => void, reject: (err: Error) => void }> = new Map();
+    // Reservations that are ACKed but waiting for READY from peer
+    private waitingForReady: Map<number, { channel?: RTCDataChannel, label?: string }> = new Map();
+
 
     // Callback when a reservation is acknowledged by the peer (Receiver side)
     public onReserved?: (id: number, channel?: RTCDataChannel, label?: string) => void;
@@ -17,15 +20,19 @@ export class Negotiator {
         this.setupSignalingChannel();
     }
 
+    public async sendReady(id: number): Promise<void> {
+        this.send({ type: 'READY', id });
+    }
+
     /**
      * Reserve a new DataChannel ID.
      * Uses getStats to find an unused ID, then performs a handshake with the peer.
      */
-    async reserveId(label: string): Promise<number> {
+    async reserveId(label: string, excludedIds: Set<number> = new Set()): Promise<number> {
         let attempts = 0;
         const maxAttempts = 5;
 
-        const excludedIds = new Set<number>();
+
         while (attempts < maxAttempts) {
             attempts++;
             const candidateId = await this.findUnusedId(excludedIds);
@@ -44,7 +51,7 @@ export class Negotiator {
         throw new RTCFetcherError('Failed to negotiate DataChannel ID after multiple attempts', 'NEGOTIATION_FAILED');
     }
 
-    private async performHandshake(id: number, label: string): Promise<void> {
+    public async performHandshake(id: number, label: string): Promise<void> {
         return new Promise<void>((resolve, reject) => {
             const timeout = setTimeout(() => {
                 this.pendingReservations.delete(id);
@@ -68,7 +75,16 @@ export class Negotiator {
 
     private async handleReserveRequest(message: NegotiationMessage) {
         const id = message.id;
+
+        // Idempotency check: If we are already waiting for READY for this ID, just resend ACK.
+        if (this.waitingForReady.has(id)) {
+            console.log(`[Negotiator] Duplicate Reserve Request for ID ${id}. Resending ACK.`);
+            this.send({ type: 'ACK', id });
+            return;
+        }
+
         let isUsed = await this.isIdUsed(id);
+        console.log(`[Negotiator] Handle Reserve ID: ${id}. isUsed (stats): ${isUsed}`);
 
         let probeChannel: RTCDataChannel | undefined;
 
@@ -78,6 +94,7 @@ export class Negotiator {
             try {
                 // Keep this channel open to prevent race condition when reusing the ID
                 probeChannel = this.pc.createDataChannel('probe', { negotiated: true, id });
+                console.log(`[Negotiator] Probe created for ID ${id}. State: ${probeChannel.readyState}`);
             } catch (e) {
                 console.warn(`ID ${id} probing failed, marking as used.`, e);
                 isUsed = true;
@@ -85,16 +102,30 @@ export class Negotiator {
         }
 
         if (isUsed) {
+            console.warn(`[Negotiator] Rejecting ID ${id} (Used or Probe Failed)`);
             this.send({ type: 'NACK', id });
         } else {
             // Tentatively "reserve" by sending ACK.
-            // The peer will open the channel immediately.
-            // If we also open immediately upon ACK, conflict is avoided because both agree it was free.
+            // But WAIT for READY before triggering application logic.
+            this.waitingForReady.set(id, { channel: probeChannel, label: message.label });
             this.send({ type: 'ACK', id });
 
+            // NOTE: We do NOT call onReserved here anymore.
+            // We wait for Sender to Create Channel -> Send READY -> handleReady -> onReserved.
+        }
+    }
+
+    private handleReady(message: NegotiationMessage) {
+        const id = message.id;
+        const waiting = this.waitingForReady.get(id);
+        if (waiting) {
+            this.waitingForReady.delete(id);
             if (this.onReserved) {
-                this.onReserved(id, probeChannel, message.label);
+                this.onReserved(id, waiting.channel, waiting.label);
             }
+        } else {
+            // Received READY for unknown ID? Maybe we already processed it or timeout.
+            // Ignore.
         }
     }
 
@@ -131,6 +162,9 @@ export class Negotiator {
                     case 'NACK':
                         this.handleNack(message);
                         break;
+                    case 'READY':
+                        this.handleReady(message);
+                        break;
                 }
             } catch (error) {
                 console.error('Signaling channel error:', error);
@@ -146,7 +180,7 @@ export class Negotiator {
         }
     }
 
-    private async findUnusedId(excludedIds?: Set<number>): Promise<number> {
+    public async findUnusedId(excludedIds?: Set<number>): Promise<number> {
         const usedIds = await this.getUsedIds();
 
         // Dynamic limit check

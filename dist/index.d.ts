@@ -57,20 +57,23 @@ declare class Negotiator {
     private static readonly SIGNALING_CHANNEL_ID;
     private static readonly MAX_CHANNEL_ID;
     private pendingReservations;
+    private waitingForReady;
     onReserved?: (id: number, channel?: RTCDataChannel, label?: string) => void;
     constructor(signalingChannel: RTCDataChannel, pc: RTCPeerConnection);
+    sendReady(id: number): Promise<void>;
     /**
      * Reserve a new DataChannel ID.
      * Uses getStats to find an unused ID, then performs a handshake with the peer.
      */
-    reserveId(label: string): Promise<number>;
-    private performHandshake;
+    reserveId(label: string, excludedIds?: Set<number>): Promise<number>;
+    performHandshake(id: number, label: string): Promise<void>;
     private handleReserveRequest;
+    private handleReady;
     private handleAck;
     private handleNack;
     private setupSignalingChannel;
     private send;
-    private findUnusedId;
+    findUnusedId(excludedIds?: Set<number>): Promise<number>;
     private isIdUsed;
     private getUsedIds;
 }
@@ -90,23 +93,52 @@ declare class RTCSerializationError extends RTCFetcherError {
     constructor(message?: string, cause?: any);
 }
 
-declare class SendStream {
+type DataHandler = (data: Uint8Array) => void;
+type CreditHandler = (amount: number) => void;
+declare class DataChannelController {
     private readonly channel;
+    onData?: DataHandler;
+    private _onCredit?;
+    private pendingCredit;
+    private readonly instanceId;
+    constructor(channel: RTCDataChannel);
+    set onCredit(handler: CreditHandler | undefined);
+    get onCredit(): CreditHandler | undefined;
+    get readyState(): RTCDataChannelState;
+    get bufferedAmount(): number;
+    get underlyingChannel(): RTCDataChannel;
+    sendData(data: Uint8Array): void;
+    sendCredit(amount: number): void;
+    close(): void;
+    private handleMessage;
+    private processBuffer;
+}
+
+declare class SendStream {
     private readonly highWaterMark;
     private readonly stream;
     private writer?;
-    constructor(channel: RTCDataChannel, highWaterMark?: number);
+    private controller;
+    private sendWindow;
+    private creditResolvers;
+    constructor(channelOrController: RTCDataChannel | DataChannelController, highWaterMark?: number);
     get writable(): WritableStream<Uint8Array>;
     write(data: Uint8Array): Promise<void>;
     close(): Promise<void>;
+    private readonly maxChunkSize;
     private writeChunk;
+    private waitForCredit;
+    private processPendingWrites;
     private waitForBufferedAmountLow;
 }
 
 declare class ReceiveStream {
-    private readonly channel;
     private readonly stream;
-    constructor(channel: RTCDataChannel);
+    private controller;
+    private unacknowledgedBytes;
+    private readonly initialCredit;
+    constructor(channelOrController: RTCDataChannel | DataChannelController);
+    private flushCredits;
     get readable(): ReadableStream<Uint8Array>;
 }
 

@@ -1,4 +1,4 @@
-export type NegotiationMessageType = 'RESERVE' | 'ACK' | 'NACK';
+export type NegotiationMessageType = 'RESERVE' | 'ACK' | 'NACK' | 'READY';
 
 export interface NegotiationMessage {
     type: NegotiationMessageType;

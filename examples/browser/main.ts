@@ -4,6 +4,8 @@ import { RTCFetcher, RTCFetcherError } from '@yuphon/rtcfetcher';
 const connectBtn = document.getElementById('connectBtn') as HTMLButtonElement;
 const sendReqBtn = document.getElementById('sendReqBtn') as HTMLButtonElement;
 const sendStreamBtn = document.getElementById('sendStreamBtn') as HTMLButtonElement;
+const sendLargeBtn = document.getElementById('sendLargeBtn') as HTMLButtonElement;
+const sendMtuStreamBtn = document.getElementById('sendMtuStreamBtn') as HTMLButtonElement;
 const log1 = document.getElementById('log1') as HTMLDivElement;
 const log2 = document.getElementById('log2') as HTMLDivElement;
 
@@ -47,6 +49,31 @@ pc2.onconnectionstatechange = () => log(2, `Connection State: ${pc2.connectionSt
 const fetcher1 = new RTCFetcher(pc1);
 const fetcher2 = new RTCFetcher(pc2);
 
+// Helper to read and log stream
+async function readAndLogStream(peer: 1 | 2, name: string, stream: ReadableStream, isBinary = false) {
+    const reader = stream.getReader();
+    log(peer, `Start reading stream: ${name}`);
+    let total = 0;
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+                log(peer, `Stream ${name} finished. Total bytes: ${total}`);
+                break;
+            }
+            total += value.byteLength;
+            if (isBinary) {
+                log(peer, `[${name}] Received chunk: ${value.byteLength} bytes. (Total: ${total})`);
+            } else {
+                const text = new TextDecoder().decode(value);
+                log(peer, `[${name}] Received: ${text}`);
+            }
+        }
+    } catch (e) {
+        log(peer, `Stream ${name} error`, e);
+    }
+}
+
 // Setup Receiver (Peer 2)
 function setupReceiver() {
     const reader = fetcher2.incomingRequests.getReader();
@@ -63,20 +90,36 @@ function setupReceiver() {
 
                 // Open request to get body
                 const { req: requestData, res } = await req.open();
-                log(2, 'Request Body:', requestData.body);
+                // log(2, 'Request Body:', requestData.body);
+
+                // Consume streams if present
+                const body = requestData.body;
+                if (body && typeof body === 'object') {
+                    if (body.myStream instanceof ReadableStream) {
+                        readAndLogStream(2, 'myStream', body.myStream);
+                    }
+                    if (body.myStream2 instanceof ReadableStream) {
+                        readAndLogStream(2, 'myStream2', body.myStream2);
+                    }
+                    if (body.data instanceof ReadableStream) {
+                        log(2, 'Received "data" as ReadableStream (Auto-streamed)!');
+                        readAndLogStream(2, 'data-stream', body.data, true);
+                    } else if (body.data) {
+                        log(2, `Received "data" as normal object. Size: ${body.data.byteLength || body.data.length}`);
+                    }
+                }
 
                 // Simulate processing delay
                 await new Promise(r => setTimeout(r, 500));
 
-                // Send response
+                // Send response (Without echoing streams, as they are being consumed)
                 const responseData = {
-                    echo: requestData.body,
+                    msg: "Streams received and being processed",
                     timestamp: Date.now(),
                     receiver: 'Peer2'
                 };
                 log(2, 'Sending Response', responseData);
                 res.send(responseData);
-                // res.close(); // Optional, depending on if we want to stream more
             }
         } catch (e) {
             log(2, 'Error in receiver loop', e);
@@ -104,6 +147,8 @@ connectBtn.addEventListener('click', async () => {
         connectBtn.disabled = true;
         sendReqBtn.disabled = false;
         sendStreamBtn.disabled = false;
+        sendLargeBtn.disabled = false;
+        sendMtuStreamBtn.disabled = false;
     } catch (e) {
         log(1, 'Connection failed', e);
     }
@@ -131,7 +176,9 @@ sendReqBtn.addEventListener('click', async () => {
 // Send Stream Request
 sendStreamBtn.addEventListener('click', async () => {
     try {
-        const stream = new ReadableStream({
+        log(1, 'Creating 2 Streams...');
+
+        const stream1 = new ReadableStream({
             start(controller) {
                 let i = 0;
                 const interval = setInterval(() => {
@@ -140,24 +187,94 @@ sendStreamBtn.addEventListener('click', async () => {
                         controller.close();
                         return;
                     }
-                    const chunk = `Chunk ${i++} `;
+                    const chunk = `S1-Chunk-${i++}`;
                     controller.enqueue(new TextEncoder().encode(chunk));
                 }, 200);
             }
         });
 
-        // We can send stream as part of body!
-        // Supported by new codec.
-        log(1, 'Sending Stream Request');
-        const response = await fetcher1.fetch('stream-echo', { myStream: stream });
+        const stream2 = new ReadableStream({
+            start(controller) {
+                let i = 0;
+                const interval = setInterval(() => {
+                    if (i >= 5) {
+                        clearInterval(interval);
+                        controller.close();
+                        return;
+                    }
+                    const chunk = `S2-Chunk-${i++}`;
+                    controller.enqueue(new TextEncoder().encode(chunk));
+                }, 300); // Different timing
+            }
+        });
+
+        log(1, 'Sending Request with 2 Streams');
+        // We send 2 distinct streams
+        const response = await fetcher1.fetch('stream-echo', { myStream: stream1, myStream2: stream2 });
         const json = await response.json();
         log(1, 'Response:', json);
 
-        // Receiver should encounter StreamRef. 
-        // Our receiver logic just echoes it back.
-        // If receiver sends back the StreamRef, we get a ReadableStream back!
-        // Let's see how `json` looks.
     } catch (e) {
         log(1, 'Stream Fetch Error', e);
+    }
+});
+
+// Send Large Data (Auto-Stream Test)
+sendLargeBtn.addEventListener('click', async () => {
+    try {
+        const size = 20 * 1024; // 20KB (> 16KB Threshold)
+        log(1, `Sending Large Data (${size} bytes) - Should be auto-streamed...`);
+        const payload = new Uint8Array(size);
+        // Fill with recognizable pattern
+        for (let i = 0; i < size; i++) payload[i] = i % 255;
+
+        const start = Date.now();
+        // The receiver should receive this as a ReadableStream if logic works
+        const response = await fetcher1.fetch('large-data', { data: payload });
+        const json = await response.json();
+        const duration = Date.now() - start;
+
+        log(1, `Large Data Fetch Complete in ${duration}ms`, json);
+    } catch (e) {
+        log(1, 'Large Data Error', e);
+    }
+});
+
+// Send Stream with Large Chunks (MTU Test)
+sendMtuStreamBtn.addEventListener('click', async () => {
+    try {
+        log(1, 'Starting MTU Stream Test (Sending 32KB chunks)...');
+        const chunkSize = 32 * 1024; // 32KB (Larger than 16KB MTU)
+        const totalChunks = 5;
+
+        const stream = new ReadableStream({
+            start(controller) {
+                let i = 0;
+                const pushChunk = () => {
+                    if (i >= totalChunks) {
+                        controller.close();
+                        return;
+                    }
+                    const chunk = new Uint8Array(chunkSize);
+                    // Fill with recognizable pattern
+                    chunk.fill(i + 1);
+                    controller.enqueue(chunk);
+                    i++;
+                    log(1, `Enqueued chunk ${i}/${totalChunks} (${chunkSize} bytes)`);
+
+                    setTimeout(pushChunk, 100);
+                };
+                pushChunk();
+            }
+        });
+
+        const start = Date.now();
+        const response = await fetcher1.fetch('mtu-stream', { myStream: stream });
+        const json = await response.json();
+        const duration = Date.now() - start;
+
+        log(1, `MTU Stream Test Complete in ${duration}ms`, json);
+    } catch (e) {
+        log(1, 'MTU Stream Test Error', e);
     }
 });

@@ -1,17 +1,45 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>RTCFetcher Test Page</title>
     <style>
-        body { font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-        .container { display: flex; gap: 20px; }
-        .peer { flex: 1; border: 1px solid #ccc; padding: 10px; border-radius: 8px; }
-        .log { background: #f0f0f0; padding: 10px; height: 300px; overflow-y: auto; font-family: monospace; font-size: 12px; }
-        button { margin: 5px 0; }
+        body {
+            font-family: sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .container {
+            display: flex;
+            gap: 20px;
+        }
+
+        .peer {
+            flex: 1;
+            border: 1px solid #ccc;
+            padding: 10px;
+            border-radius: 8px;
+        }
+
+        .log {
+            background: #f0f0f0;
+            padding: 10px;
+            height: 300px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 12px;
+        }
+
+        button {
+            margin: 5px 0;
+        }
     </style>
 </head>
+
 <body>
     <h1>RTCFetcher Test Page</h1>
     <div class="container">
@@ -20,6 +48,8 @@
             <button id="connectBtn">Connect Peers</button>
             <button id="sendReqBtn" disabled>Send Request</button>
             <button id="sendStreamBtn" disabled>Send Stream</button>
+            <button id="sendLargeBtn" disabled>Send Large (1MB)</button>
+            <button id="sendMtuStreamBtn" disabled>Send Stream (MTU Test)</button>
             <div id="log1" class="log"></div>
         </div>
         <div class="peer" id="peer2">
@@ -29,4 +59,5 @@
     </div>
     <script type="module" src="./main.ts"></script>
 </body>
+
 </html>

@@ -1,4 +1,5 @@
 import { ReceiveStream } from '../receiveStream';
+import { MSG_TYPE_DATA, MSG_TYPE_CREDIT } from '../../framing/channel-controller';
 
 describe('ReceiveStream', () => {
     let mockChannel: any;
@@ -6,10 +7,14 @@ describe('ReceiveStream', () => {
 
     beforeEach(() => {
         mockChannel = {
+            send: jest.fn(),
             onmessage: null,
             onclose: null,
             onerror: null,
-            close: jest.fn()
+            close: jest.fn(),
+            readyState: 'open',
+            addEventListener: jest.fn(),
+            removeEventListener: jest.fn()
         };
         receiveStream = new ReceiveStream(mockChannel);
     });
@@ -19,7 +24,16 @@ describe('ReceiveStream', () => {
         const data = new Uint8Array([1, 2, 3]);
 
         // Simulate message
-        mockChannel.onmessage({ data: data.buffer });
+        // Needs HEADER
+        const frame = new Uint8Array(1 + data.byteLength);
+        frame[0] = MSG_TYPE_DATA;
+        frame.set(data, 1);
+
+        // ReceiveStream wraps channel in DataChannelController, which listens to onmessage
+        // BUT we mocked onmessage as "null" initially.
+        // DataChannelController sets it.
+        // We need to trigger the handler SET by DataChannelController.
+        mockChannel.onmessage({ data: frame.buffer });
 
         const { value, done } = await reader.read();
         expect(value).toEqual(data);

@@ -9,8 +9,9 @@ WebRTCのDatachannel上で構築されたFetch APIです。
 ### 特徴 (Features)
 - **モダンなAPI**: 標準のFetch APIライクなインターフェースを提供。
 - **ストリーミング**: Fetch Upload Streaming機能により、Backpressureに対応したストリーミングが可能。
+- **Auto-Streaming**: 16KBを超えるBlob, Uint8Array, Stringは自動的にストリームに変換され、メインチャンネルをブロックしません。
 - **共存性**: 既存の `RTCPeerConnection` の上に構築されるため、シグナリングロジックの変更が不要。既存のDataChannelやMediaStreamと共存可能。
-- **IDネゴシエーション**: `getStats` を利用した衝突回避ロジックにより、`negotiated: true` なDataChannelを安全に動的生成。
+- **IDネゴシエーション**: 3-way handshake (`RESERVE` -> `ACK` -> `READY`) とProbingにより、競合と再利用を安全に管理。
 - **スキーマレス**: メッセージボディはスキーマレス(`any`)であり、MsgPack拡張により `ReadableStream` や `Blob` も透過的に送信可能。
 
 ## Installation
@@ -118,22 +119,34 @@ RTCFetcherは以下の専用エラーをスローします。
 - **`RTCConnectionError`**: 通信中に `RTCPeerConnection` が切断された場合。
 - **`RTCSerializationError`**: データのシリアライズ/デシリアライズに失敗した場合。
 
+## Protocol
+
+### Message Framing
+`msgpack-lite` によるシリアライズに加え、**4バイトのLength-Prefix** (Little Endian) を付与することで、ストリーム境界を明確化しています。これにより、「無限読み込み」を防ぎ、確実にメッセージ全体を受信してからデコードを行います。
+
+### Stream Handling & Auto-Streaming
+`RTCFetcher` は `ReadableStream` を透過的に転送します。
+さらに、v0.5.0以降では **Auto-Streaming** 機能により、以下のデータがペイロード内で検出されると、自動的に別のDataChannelストリームに切り出されます：
+- 16KB を超える `String`, `Uint8Array`, `ArrayBuffer`
+- `Blob`, `File`
+
+これにより、巨大なデータがメインの制御チャンネルをブロックするのを防ぎます。
+
 ## Architecture
 
-### ID Negotiation via WebRTC Stats
-`negotiated: true` (ondatachannelを発火させない) を維持しつつ、ID衝突を避けるために以下のロジックを採用しています。
+### ID Negotiation (3-Way Handshake)
+初期の `getStats` チェックに加え、堅牢な **3-way handshake** (`RESERVE` -> `ACK` -> `READY`) を採用しています。
 
-1. **Master Channel**: ID `255` を制御用のMaster Channelとして常時使用。
-2. **Dynamic ID Reservation**:
-   - 新しい通信を開始する際、`pc.getStats()` を実行して現在使用中のDataChannel IDを確認。
-   - 未使用のIDを検索し、Master Channel経由で相手に「予約(RESERVE)」を要求。
-   - 相手も `getStats()` で競合がないか確認し、「承認(ACK)」を返信。
-   - 双方で合意したIDを使って `createDataChannel` を実行。
+1. **RESERVE**: 送信側が未使用ID候補を提案。
+2. **ACK**: 受信側がIDをチェックし、一時的な "Probe Channel" を作成して承諾。
+3. **READY**: 送信側がDataChannelを確立し、準備完了を通知。受信側はここで `onReserved` を発火。
 
-これにより、RTCFetcher管理外で作成されたDataChannelとのID競合を確実に防ぎます。
+このプロセスと "Probe Channel" の待機メカニズムにより、動的なID競合、Race Condition、およびチャンネルの不整合を完全に防ぎます。
 
-### Backpressure Control
-WebRTC (SCTP) 標準のフロー制御に合わせて、効率的なBackpressureを実現しています。
+### Credit-Based Backpressure
+WebRTC標準の `bufferedAmount` 監視に加え、アプリケーションレベルでの **クレジットベース** のフロー制御を実装しています。
 
-- **送信側**: `RTCDataChannel.bufferedAmount` を監視。
-- **制御**: バッファ量が閾値 (`minBufferSize`) を超えた場合、送信ストリームの読み込み(`pull`)を一時停止します。`bufferedamountlow` イベント発火時に再開することで、ネットワーク帯域に応じた適切な転送速度を維持します。
+- **Window Size**: 送信可能な残りのバイト数。
+- **Credit**: 受信側がデータを消費（`read()`）するたびに、送信側へ「クレジット（送信許可量）」を補充します。
+
+これにより、受信側の処理速度に合わせて送信速度を自動調整し、メモリ溢れを防ぎます。また、MTUに合わせて内部でデータを16KBごとのチャンクに分割送信します。
