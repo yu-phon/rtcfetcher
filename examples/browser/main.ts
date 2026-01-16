@@ -45,9 +45,13 @@ pc2.onicecandidate = e => {
 pc1.onconnectionstatechange = () => log(1, `Connection State: ${pc1.connectionState}`);
 pc2.onconnectionstatechange = () => log(2, `Connection State: ${pc2.connectionState}`);
 
-// RTCFetcher init
-const fetcher1 = new RTCFetcher(pc1);
-const fetcher2 = new RTCFetcher(pc2);
+// 2. Setup RTCFetcher
+const fetcher1 = new RTCFetcher(pc1, {
+    prefetchPoolSize: 0 // Disable pool to force 1-RTT negotiation for every request
+});
+const fetcher2 = new RTCFetcher(pc2, {
+    prefetchPoolSize: 0 // Disable pool to force 1-RTT negotiation for every request
+});
 
 // Helper to read and log stream
 async function readAndLogStream(peer: 1 | 2, name: string, stream: ReadableStream, isBinary = false) {
