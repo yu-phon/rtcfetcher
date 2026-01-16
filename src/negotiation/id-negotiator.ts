@@ -20,8 +20,8 @@ export class Negotiator {
         this.setupSignalingChannel();
     }
 
-    public async sendReady(id: number): Promise<void> {
-        this.send({ type: 'READY', id });
+    public async sendReady(id: number, label?: string): Promise<void> {
+        this.send({ type: 'READY', id, label });
     }
 
     /**
@@ -121,7 +121,9 @@ export class Negotiator {
         if (waiting) {
             this.waitingForReady.delete(id);
             if (this.onReserved) {
-                this.onReserved(id, waiting.channel, waiting.label);
+                // Late Binding: Use label from READY message if provided, otherwise fallback to original label
+                const finalLabel = message.label || waiting.label;
+                this.onReserved(id, waiting.channel, finalLabel);
             }
         } else {
             // Received READY for unknown ID? Maybe we already processed it or timeout.
@@ -188,16 +190,37 @@ export class Negotiator {
         const sctp: any = this.pc.sctp;
         const max = sctp?.maxChannels ?? sctp?.maxDataChannels;
 
-        // Use detected max, or fallback to 256 if undefined/null to be safe (Chrome default in some cases is 256)
-        // If the browser supports more, it usually reports it. If it doesn't report, we assume the lower common limit.
-        const limit = (max && max > 0) ? max : 256;
+        // Use detected max, or fallback to 256 if undefined/null to be safe
+        let limit = (max && max > 0) ? max : 256;
 
-        // Simple strategy: Sequential search to respect SCTP stream/negotiated limits
-        // We start from 1 (0 is Signaling) and find the first gap.
-        // This avoids hitting high IDs that might be outside the negotiated stream count (even if < maxChannels).
+        // Clamp to 255 as requested by user to ensure maximum compatibility
+        // (Chrome sometimes reports 65535 but fails above 255 or 2048 depending on version/network)
+        console.log(`[Negotiator] findUnusedId. Detected max: ${max}, Using limit: ${255}`);
+        if (limit > 255) limit = 255;
+
+        // Randomized Search Strategy to avoid collisions between peers
+        // Start at a random index and wrap around.
+        const start = Math.floor(Math.random() * (limit - 1)) + 1;
         let candidate = -1;
-        for (let i = 1; i < limit; i++) {
-            if (i !== Negotiator.SIGNALING_CHANNEL_ID && !usedIds.has(i) && !excludedIds?.has(i)) {
+
+        for (let offset = 0; offset < limit - 1; offset++) {
+            // (start + offset - 1) % (limit - 1) + 1  mapping to range [1, limit-1]
+            // Simplified:
+            let i = start + offset;
+            if (i >= limit) i -= (limit - 1); // Wrap around, skipping 0? 
+            // Range 1..limit-1 (size limit-1).
+            // Logic: i goes from start...(limit-1)...1...(start-1) (skipping 0 if carefully done)
+
+            // Simpler: use modulo arithmetic on zero-based range then shift
+            // Range of valid IDs: [1, limit - 1] -> Size: limit - 1
+            const rangeSize = limit - 1;
+            // zeroBased index: 0 .. rangeSize - 1
+            const zeroBased = (start - 1 + offset) % rangeSize;
+            i = zeroBased + 1;
+
+            if (i === Negotiator.SIGNALING_CHANNEL_ID) continue; // Should be covered by range [1, limit-1], but safety check
+
+            if (!usedIds.has(i) && !excludedIds?.has(i)) {
                 candidate = i;
                 break;
             }

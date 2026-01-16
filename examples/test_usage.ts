@@ -20,7 +20,7 @@ async function runExample() {
             const { done, value: req } = await reader.read();
             if (done) break;
 
-            console.log('Received request for endpoint:', req.endpoint);
+            console.log('Received request for endpoint:', req.label);
             const { req: requestData, res } = await req.open();
 
             console.log('Request Headers/Body:', requestData);

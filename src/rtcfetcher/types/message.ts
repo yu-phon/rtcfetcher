@@ -1,8 +1,8 @@
 export interface IncomingRequest {
-    endpoint: string;
+    label: string;
     open(): Promise<{
-        req: object;
-        res: { send: (data: any) => void };
+        req: { label: string, body: any };
+        res: { send: (data: any) => void; close: () => void };
     }>;
     reject(reason?: string): void;
 }
