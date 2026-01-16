@@ -11,10 +11,16 @@ import { traverseAndOptimizeStreams } from '../utils/stream-traversal';
 
 export interface RTCFetcherConfig {
     minBufferSize?: number;
+    prefetchPoolSize?: number;
 }
 
 interface RTCFetchOptions {
     signal?: AbortSignal;
+}
+
+interface PooledChannel {
+    id: number;
+    channel: RTCDataChannel;
 }
 
 export class RTCFetcher {
@@ -30,6 +36,8 @@ export class RTCFetcher {
 
     // Cache reserved channels (streams) to avoid collisions
     private reservedChannels: Map<number, RTCDataChannel> = new Map();
+    // ID Pool for 0-RTT negotiation (Stores Physical Channel Objects)
+    private idPool: PooledChannel[] = [];
 
     constructor(
         private pc: RTCPeerConnection,
@@ -53,6 +61,8 @@ export class RTCFetcher {
         this.opened = new Promise<void>((resolve) => {
             const checkOpen = () => {
                 if (this.masterChannel.readyState === 'open') {
+                    // Start filling the pool once connected
+                    this.refillPool();
                     resolve();
                     return true;
                 }
@@ -63,6 +73,33 @@ export class RTCFetcher {
                 this.masterChannel.onopen = () => checkOpen();
             }
         });
+    }
+
+    private async refillPool() {
+        const targetSize = this.config.prefetchPoolSize ?? 5;
+        // Avoid concurrent refills or over-filling
+        if (this.idPool.length >= targetSize) return;
+
+        console.log(`[RTCFetcher] Refilling ID Pool (Current: ${this.idPool.length}, Target: ${targetSize})`);
+
+        while (this.idPool.length < targetSize) {
+            try {
+                // Determine excluded IDs: Reserved Channels + Current Pool + (Negotiator checks used)
+                const excluded = new Set<number>([...this.reservedChannels.keys(), ...this.idPool.map(p => p.id)]);
+
+                // Reserve with generic label. Real label is sent via ID-Negotiator's updated sendReady
+                const id = await this.negotiator.reserveId('__pooled__', excluded);
+
+                // Physical ID Lock: Create the channel immediately to prevent external collisions.
+                const channel = this.pc.createDataChannel('__pooled__', { negotiated: true, id });
+                console.log(`[RTCFetcher] Created Pooled Channel ID: ${id}`);
+
+                this.idPool.push({ id, channel });
+            } catch (e) {
+                console.warn('[RTCFetcher] Failed to refill ID pool:', e);
+                break; // Stop refilling on error (e.g. negotiation failure)
+            }
+        }
     }
 
     private handleReservedChannel(id: number, existingChannel?: RTCDataChannel, label?: string) {
@@ -162,6 +199,7 @@ export class RTCFetcher {
 
     private async sendResponse(controller: DataChannelController, data: any) {
         const streams: Map<number, ReadableStream> = new Map();
+        const preCreatedChannels = new Map<number, RTCDataChannel>();
 
         // Exclude the current channel ID to be safe, though getStats might already cover it.
         // Also we need to accumulate reserved IDs to pass to subsequent reserveId calls
@@ -173,8 +211,25 @@ export class RTCFetcher {
         }
 
         const processed = await this.traverseAndExtractStreams(data, async (stream) => {
-            const id = await this.negotiator.reserveId('res-stream', excludedIds);
+            let id: number;
+            // Physical ID Lock: Reuse pooled channel logic
+            let pooledChannel: RTCDataChannel | undefined;
+
+            if (this.idPool.length > 0) {
+                const pooled = this.idPool.shift()!;
+                id = pooled.id;
+                pooledChannel = pooled.channel;
+                this.refillPool();
+            } else {
+                id = await this.negotiator.reserveId('res-stream', excludedIds);
+            }
+
             excludedIds.add(id);
+
+            if (pooledChannel) {
+                preCreatedChannels.set(id, pooledChannel);
+            }
+
             streams.set(id, stream);
             return new StreamRef(id);
         });
@@ -186,11 +241,14 @@ export class RTCFetcher {
         // Open stream channels and Signal READY
         const streamReadyPromises: Promise<void>[] = [];
         streams.forEach((stream, id) => {
-            const sChannel = this.pc.createDataChannel('res-stream', { negotiated: true, id });
+            // Check if we have a pre-created (pooled) channel
+            const sChannel = preCreatedChannels.get(id) || this.pc.createDataChannel('res-stream', { negotiated: true, id });
+
             const sStream = new SendStream(sChannel, this.config.minBufferSize);
             stream.pipeTo(sStream.writable).catch(e => console.error(e));
 
-            streamReadyPromises.push(this.negotiator.sendReady(id));
+            // Label overrides pooled 'default'
+            streamReadyPromises.push(this.negotiator.sendReady(id, 'res-stream'));
         });
         await Promise.all(streamReadyPromises);
 
@@ -287,62 +345,73 @@ export class RTCFetcher {
     public async fetch(label: string, body: any, _options?: RTCFetchOptions): Promise<RTCResponse> {
         await this.opened;
 
-        // 1. Find ID
-        const reservedId = await this.negotiator.findUnusedId();
+        let reservedId: number;
+        let isPooled = false;
+        let pooledChannel: RTCDataChannel | undefined;
+
+        // 1. Find ID (Try Pool First)
+        if (this.idPool.length > 0) {
+            const pooled = this.idPool.shift()!;
+            reservedId = pooled.id;
+            pooledChannel = pooled.channel;
+
+            console.log(`[RTCFetcher] Using Pooled ID: ${reservedId}`);
+            isPooled = true;
+            this.refillPool(); // Trigger refill in background
+        } else {
+            console.log(`[RTCFetcher] Pool Empty. Negotiating directly...`);
+            reservedId = await this.negotiator.findUnusedId();
+            isPooled = false;
+        }
 
         // 2. Prepare Body (Traverse streams)
-        // We do this BEFORE creating channel? Or after?
-        // Doesn't matter, but better before if it fails.
-        // Traverse needs negotiator to stream ids? Yes.
-
         const streams: Map<number, ReadableStream> = new Map();
         const streamCache: Map<ReadableStream, StreamRef> = new Map();
+        // Stores channels (streams) that were taken from the pool
+        const preCreatedStreamChannels: Map<number, RTCDataChannel> = new Map();
 
         // Exclude the Main Channel ID from stream ID selection.
-        const excludedIds = new Set<number>([reservedId]);
+        const excludedIds = new Set<number>([reservedId, ...this.idPool.map(p => p.id)]);
 
         const processedBody = await this.traverseAndExtractStreams(body, async (stream) => {
             if (streamCache.has(stream)) return streamCache.get(stream)!;
-            const streamId = await this.negotiator.reserveId('stream', excludedIds); // This reserves and handshakes. 
 
-            // Add newly reserved stream ID to excluded list for next iterations
+            // Try pool for streams too
+            let streamId: number;
+            if (this.idPool.length > 0) {
+                const p = this.idPool.shift()!;
+                streamId = p.id;
+                preCreatedStreamChannels.set(streamId, p.channel);
+                this.refillPool();
+            } else {
+                streamId = await this.negotiator.reserveId('stream', excludedIds);
+            }
+
             excludedIds.add(streamId);
-            // Wait. streams also have race condition? 
-            // Yes. Receiver opens stream channel immediately.
-            // We should use findUnusedId here too?
-            // For now let's fix Main Channel first. Stream channels are simpler (one way?).
-            // stream.pipeTo(sendStream).
-            // Actually, if Peer creates stream channel and sends credit...
-            // Yes, same race.
-            // But let's fix Main first.
-
             streams.set(streamId, stream);
             const ref = new StreamRef(streamId);
             streamCache.set(stream, ref);
             return ref;
         });
 
-
-
-        // 4. Perform Handshake
-        // Now if peer sends immediately, we are ready.
-
-
-        // 5. Handshake
-        await this.negotiator.performHandshake(reservedId, 'req::' + label);
+        // 5. Handshake (Only if NOT pulled from pool)
+        if (!isPooled) {
+            await this.negotiator.performHandshake(reservedId, 'req::' + label);
+        }
 
         // 6. Create Channel & Controller (Sender Side) - POST HANDSHAKE
         console.log("Reserved ID (Local):", reservedId);
-        const mainChannel = this.pc.createDataChannel(label, { negotiated: true, id: reservedId });
+        // Reuse pooled channel if available, or create new
+        const mainChannel = pooledChannel || this.pc.createDataChannel(label, { negotiated: true, id: reservedId });
         const controller = new DataChannelController(mainChannel);
 
         const responseReader = new ReceiveStream(controller);
         const sendStream = new SendStream(controller, this.config.minBufferSize);
 
-
         // 6. Signal Channel Ready
-        // This tells the receiver we are ready to accept messages (like Credit).
-        await this.negotiator.sendReady(reservedId);
+        // This tells the receiver we are ready.
+        // Provide the Label override here for Late Binding!
+        await this.negotiator.sendReady(reservedId, 'req::' + label);
 
         const encoded = msgpackCodec.encode({ label, body: processedBody });
 
@@ -359,27 +428,15 @@ export class RTCFetcher {
             });
         }
 
-
-
-
-
-
         const streamReadyPromises: Promise<void>[] = [];
         streams.forEach((stream, id) => {
-            const channel = this.pc.createDataChannel('stream', { negotiated: true, id });
+            const channel = preCreatedStreamChannels.get(id) || this.pc.createDataChannel('stream', { negotiated: true, id });
+
             const sStream = new SendStream(channel, this.config.minBufferSize);
             stream.pipeTo(sStream.writable).catch(e => console.error(e));
 
             // Signal readiness for this stream channel too!
-            // We push to promise array to await them in parallel if needed, 
-            // OR we can just fire and forget if order doesn't matter (Wait, Receiver needs READY before Body processing?)
-            // Receiver processes body -> open stream.
-            // Body processing happens after bufferAndDecode.
-            // bufferAndDecode starts receiving immediately.
-            // If body arrives before READY(stream), getOrOpenChannel fails.
-            // So we MUST ensure READY arrives.
-            // Sequential await inside forEach is bad.
-            streamReadyPromises.push(this.negotiator.sendReady(id));
+            streamReadyPromises.push(this.negotiator.sendReady(id, 'stream'));
         });
         await Promise.all(streamReadyPromises);
 

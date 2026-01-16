@@ -20,8 +20,8 @@ export class Negotiator {
         this.setupSignalingChannel();
     }
 
-    public async sendReady(id: number): Promise<void> {
-        this.send({ type: 'READY', id });
+    public async sendReady(id: number, label?: string): Promise<void> {
+        this.send({ type: 'READY', id, label });
     }
 
     /**
@@ -121,7 +121,9 @@ export class Negotiator {
         if (waiting) {
             this.waitingForReady.delete(id);
             if (this.onReserved) {
-                this.onReserved(id, waiting.channel, waiting.label);
+                // Late Binding: Use label from READY message if provided, otherwise fallback to original label
+                const finalLabel = message.label || waiting.label;
+                this.onReserved(id, waiting.channel, finalLabel);
             }
         } else {
             // Received READY for unknown ID? Maybe we already processed it or timeout.

@@ -12,6 +12,7 @@ WebRTCのDatachannel上で構築されたFetch APIです。
 - **Auto-Streaming**: 16KBを超えるBlob, Uint8Array, Stringは自動的にストリームに変換され、メインチャンネルをブロックしません。
 - **共存性**: 既存の `RTCPeerConnection` の上に構築されるため、シグナリングロジックの変更が不要。既存のDataChannelやMediaStreamと共存可能。
 - **IDネゴシエーション**: 3-way handshake (`RESERVE` -> `ACK` -> `READY`) とProbingにより、競合と再利用を安全に管理。
+- **Zero-RTT Handshake**: IDプール機能（`prefetchPoolSize`）により、バックグラウンドでIDを事前交渉。リクエスト開始時のハンドシェイク待ち時間を排除し、即座に送信を開始します。
 - **スキーマレス**: メッセージボディはスキーマレス(`any`)であり、MsgPack拡張により `ReadableStream` や `Blob` も透過的に送信可能。
 
 ## Installation
@@ -36,7 +37,8 @@ const pc = new RTCPeerConnection(config);
 // ... シグナリング処理 ...
 
 // 2. RTCFetcher を初期化
-const fetcher = new RTCFetcher(pc);
+// prefetchPoolSize: バックグラウンドで確保しておくIDの数 (デフォルト: 5)
+const fetcher = new RTCFetcher(pc, { prefetchPoolSize: 5 });
 
 // 3. 利用開始 (Master Channelの確立を待つ)
 await fetcher.opened;
