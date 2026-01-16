@@ -81,20 +81,23 @@ try {
 const reqs = fetcher.incomingRequests.getReader();
 
 while (true) {
-    const { done, value } = await reqs.read();
+    const { done, value: incoming } = await reqs.read();
     if (done) break;
 
-    const { req, res } = value.open();
-    
-    // req.label で分岐
-    if (req.label === "my-endpoint") {
-        console.log("Received:", req.body);
-        
-        // レスポンスを返す
-        res.send({ status: "processed", feedback: "ok" });
-    } else {
-        res.close(); // ハンドルしない場合は閉じる
+    // 1. Check Label BEFORE opening (Security)
+    if (incoming.label !== "my-endpoint") {
+        console.warn("Unknown endpoint:", incoming.label);
+        incoming.reject();
+        continue;
     }
+
+    // 2. Open to receive body/streams
+    const { req, res } = await incoming.open();
+    
+    console.log("Received:", req.body);
+    
+    // レスポンスを返す
+    res.send({ status: "processed", feedback: "ok" });
 }
 ```
 

@@ -85,8 +85,8 @@ function setupReceiver() {
                 const { done, value: req } = await reader.read();
                 if (done) break;
 
-                log(2, `Received Request: ${req.endpoint}`);
-                log(1, `[Remote] Peer 2 confirmed receipt of request: ${req.endpoint}`);
+                log(2, `Received Request: ${req.label}`);
+                log(1, `[Remote] Peer 2 confirmed receipt of request: ${req.label}`);
 
                 // Open request to get body
                 const { req: requestData, res } = await req.open();
