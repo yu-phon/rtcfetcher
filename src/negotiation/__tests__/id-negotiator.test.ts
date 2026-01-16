@@ -52,7 +52,15 @@ describe('Negotiator', () => {
 
             expect(sentMessages.length).toBe(1);
             expect(sentMessages[0]).toEqual({ type: 'ACK', id: 100 });
-            // onReserved is now called with (id, channel, label)
+
+            // onReserved should NOT be called yet (waiting for READY)
+            expect(onReservedSpy).not.toHaveBeenCalled();
+
+            // Simulate receiving READY
+            const readyMsg = { type: 'READY', id: 100 };
+            await mockDataChannel.onmessage!({ data: JSON.stringify(readyMsg) } as MessageEvent);
+
+            // NOW onReserved should be called
             expect(onReservedSpy).toHaveBeenCalledWith(100, expect.objectContaining({ label: 'probe' }), 'req');
         });
 

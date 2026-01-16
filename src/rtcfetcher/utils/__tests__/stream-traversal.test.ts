@@ -4,7 +4,7 @@ import { StreamRef } from '../../types/stream-ref';
 // We assume checking environment has ReadableStream or polyfill.
 
 describe('traverseAndOptimizeStreams', () => {
-    const mockReplacer = jest.fn(async (stream: ReadableStream) => {
+    const mockReplacer = jest.fn(async (_stream: ReadableStream) => {
         return new StreamRef(123);
     });
 

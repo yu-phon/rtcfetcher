@@ -36,10 +36,7 @@ const pc = new RTCPeerConnection(config);
 // ... シグナリング処理 ...
 
 // 2. RTCFetcher を初期化
-// オプションでタイムアウトやバッファ設定が可能
-const fetcher = new RTCFetcher(pc, {
-    minBufferSize: 64 * 1024, // Backpressure制御の閾値
-});
+const fetcher = new RTCFetcher(pc);
 
 // 3. 利用開始 (Master Channelの確立を待つ)
 await fetcher.opened;
@@ -103,7 +100,7 @@ while (true) {
 
 ### `RTCFetcher`
 - `constructor(pc: RTCPeerConnection, config?: RTCFetcherConfig)`
-  - `config.minBufferSize`: Backpressure が発動する `bufferedAmount` の下限値。
+  - `pc`: 既知の `RTCPeerConnection` インスタンス。
 
 ### `fetch(label: string, body: any, options?: RTCFetchOptions): Promise<RTCResponse>`
 - **label**: リクエスト識別子。
@@ -143,10 +140,10 @@ RTCFetcherは以下の専用エラーをスローします。
 
 このプロセスと "Probe Channel" の待機メカニズムにより、動的なID競合、Race Condition、およびチャンネルの不整合を完全に防ぎます。
 
-### Credit-Based Backpressure
-WebRTC標準の `bufferedAmount` 監視に加え、アプリケーションレベルでの **クレジットベース** のフロー制御を実装しています。
+### Credit-Based Flow Control
+`bufferedAmount` に依存した従来の制御に加え、アプリケーションレベルでの **クレジットベース** のフロー制御を導入しました。
 
 - **Window Size**: 送信可能な残りのバイト数。
 - **Credit**: 受信側がデータを消費（`read()`）するたびに、送信側へ「クレジット（送信許可量）」を補充します。
 
-これにより、受信側の処理速度に合わせて送信速度を自動調整し、メモリ溢れを防ぎます。また、MTUに合わせて内部でデータを16KBごとのチャンクに分割送信します。
+これにより、WebRTCのバッファ溢れを防ぎつつ、受信側の処理能力に合わせたスムーズな転送を実現しています。また、MTUに合わせてデータを適切にチャンク分割して送信します。

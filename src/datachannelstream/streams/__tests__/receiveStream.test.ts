@@ -1,5 +1,5 @@
 import { ReceiveStream } from '../receiveStream';
-import { MSG_TYPE_DATA, MSG_TYPE_CREDIT } from '../../framing/channel-controller';
+import { MSG_TYPE_DATA } from '../../framing/channel-controller';
 
 describe('ReceiveStream', () => {
     let mockChannel: any;
