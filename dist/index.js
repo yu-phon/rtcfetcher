@@ -83,8 +83,8 @@ var _Negotiator = class _Negotiator {
     this.waitingForReady = /* @__PURE__ */ new Map();
     this.setupSignalingChannel();
   }
-  async sendReady(id) {
-    this.send({ type: "READY", id });
+  async sendReady(id, label) {
+    this.send({ type: "READY", id, label });
   }
   /**
    * Reserve a new DataChannel ID.
@@ -158,7 +158,8 @@ var _Negotiator = class _Negotiator {
     if (waiting) {
       this.waitingForReady.delete(id);
       if (this.onReserved) {
-        this.onReserved(id, waiting.channel, waiting.label);
+        const finalLabel = message.label || waiting.label;
+        this.onReserved(id, waiting.channel, finalLabel);
       }
     } else {
     }
@@ -213,10 +214,19 @@ var _Negotiator = class _Negotiator {
     const usedIds = await this.getUsedIds();
     const sctp = this.pc.sctp;
     const max = sctp?.maxChannels ?? sctp?.maxDataChannels;
-    const limit = max && max > 0 ? max : 256;
+    let limit = max && max > 0 ? max : 256;
+    console.log(`[Negotiator] findUnusedId. Detected max: ${max}, Using limit: ${255}`);
+    if (limit > 255) limit = 255;
+    const start = Math.floor(Math.random() * (limit - 1)) + 1;
     let candidate = -1;
-    for (let i = 1; i < limit; i++) {
-      if (i !== _Negotiator.SIGNALING_CHANNEL_ID && !usedIds.has(i) && !excludedIds?.has(i)) {
+    for (let offset = 0; offset < limit - 1; offset++) {
+      let i = start + offset;
+      if (i >= limit) i -= limit - 1;
+      const rangeSize = limit - 1;
+      const zeroBased = (start - 1 + offset) % rangeSize;
+      i = zeroBased + 1;
+      if (i === _Negotiator.SIGNALING_CHANNEL_ID) continue;
+      if (!usedIds.has(i) && !excludedIds?.has(i)) {
         candidate = i;
         break;
       }
@@ -737,18 +747,28 @@ var RTCFetcher = class {
     this.pc = pc;
     // Cache reserved channels (streams) to avoid collisions
     this.reservedChannels = /* @__PURE__ */ new Map();
+    // ID Pool for 0-RTT negotiation (Stores Physical Channel Objects)
+    this.idPool = [];
+    // Pending Queue for Backpressure
+    this.pendingChannelQueue = [];
     this.config = config || {};
     this.masterChannel = pc.createDataChannel("rtc-fetcher-master", { negotiated: true, id: 0 });
     this.negotiator = new Negotiator(this.masterChannel, pc);
     this.incomingRequests = new ReadableStream({
       start: (controller) => {
         this.incomingRequestsController = controller;
+      },
+      pull: () => {
+        this.pumpIncomingRequests();
       }
+    }, {
+      highWaterMark: this.config.incomingHighWaterMark ?? 5
     });
     this.negotiator.onReserved = (id, channel, label) => this.handleReservedChannel(id, channel, label);
     this.opened = new Promise((resolve) => {
       const checkOpen = () => {
         if (this.masterChannel.readyState === "open") {
+          this.refillPool();
           resolve();
           return true;
         }
@@ -758,6 +778,23 @@ var RTCFetcher = class {
         this.masterChannel.onopen = () => checkOpen();
       }
     });
+  }
+  async refillPool() {
+    const targetSize = this.config.prefetchPoolSize ?? 5;
+    if (this.idPool.length >= targetSize) return;
+    console.log(`[RTCFetcher] Refilling ID Pool (Current: ${this.idPool.length}, Target: ${targetSize})`);
+    while (this.idPool.length < targetSize) {
+      try {
+        const excluded = /* @__PURE__ */ new Set([...this.reservedChannels.keys(), ...this.idPool.map((p) => p.id)]);
+        const id = await this.negotiator.reserveId("__pooled__", excluded);
+        const channel = this.pc.createDataChannel("__pooled__", { negotiated: true, id });
+        console.log(`[RTCFetcher] Created Pooled Channel ID: ${id}`);
+        this.idPool.push({ id, channel });
+      } catch (e) {
+        console.warn("[RTCFetcher] Failed to refill ID pool:", e);
+        break;
+      }
+    }
   }
   handleReservedChannel(id, existingChannel, label) {
     try {
@@ -770,30 +807,41 @@ var RTCFetcher = class {
         }
         return;
       }
-      console.log("Reserved ID:", id);
+      let endpoint = label || "default";
+      if (endpoint.startsWith("req::")) {
+        endpoint = endpoint.substring(5);
+      }
+      console.log(`[RTCFetcher] Handle Req Channel ID: ${id}, Label: ${endpoint}`);
       const channel = existingChannel || this.pc.createDataChannel("rtc-fetcher-req", { negotiated: true, id });
-      console.log("Created/Reused channel:", channel.id);
-      const controller = new DataChannelController(channel);
-      const receiveStream = new ReceiveStream(controller);
-      this.processIncomingMessage(receiveStream.readable, controller);
+      this.pendingChannelQueue.push({ label: endpoint, channel });
+      this.pumpIncomingRequests();
     } catch (e) {
       console.error("Error handling reserved channel:", e);
     }
   }
-  async processIncomingMessage(stream, controller) {
-    const info = await this.bufferAndDecode(stream);
-    if (!info) return;
-    const { label, body } = info;
-    const processedBody = await this.processedIncomingBody(body);
+  pumpIncomingRequests() {
+    if (!this.incomingRequestsController) return;
+    while (this.incomingRequestsController.desiredSize !== null && this.incomingRequestsController.desiredSize > 0 && this.pendingChannelQueue.length > 0) {
+      const item = this.pendingChannelQueue.shift();
+      this.createAndEnqueueRequest(item.label, item.channel);
+    }
+  }
+  createAndEnqueueRequest(label, channel) {
     const req = {
-      endpoint: label,
-      // We use endpoint property in IncomingRequest interface
-      // We match IncomingRequest interface from src/rtcfetcher/types/message.ts?
-      // "open(): Promise<{ req: object, res: { send } }>"
+      label,
       open: async () => {
+        console.log(`[RTCFetcher] Opening Request: ${label} (ID: ${channel.id})`);
+        const controller = new DataChannelController(channel);
+        const receiveStream = new ReceiveStream(controller);
+        const info = await this.bufferAndDecode(receiveStream.readable);
+        if (!info) {
+          controller.close();
+          throw new Error("Failed to decode request body");
+        }
+        const { body } = info;
+        const processedBody = await this.processedIncomingBody(body);
         return {
           req: { label, body: processedBody },
-          // Adjust structure as needed
           res: {
             send: (responseData) => {
               this.sendResponse(controller, responseData);
@@ -805,22 +853,33 @@ var RTCFetcher = class {
         };
       },
       reject: (_reason) => {
-        controller.close();
+        channel.close();
       }
     };
-    if (this.incomingRequestsController) {
-      this.incomingRequestsController.enqueue(req);
-    }
+    this.incomingRequestsController?.enqueue(req);
   }
   async sendResponse(controller, data) {
     const streams = /* @__PURE__ */ new Map();
+    const preCreatedChannels = /* @__PURE__ */ new Map();
     const excludedIds = /* @__PURE__ */ new Set();
     if (controller.underlyingChannel.id !== null) {
       excludedIds.add(controller.underlyingChannel.id);
     }
     const processed = await this.traverseAndExtractStreams(data, async (stream) => {
-      const id = await this.negotiator.reserveId("res-stream", excludedIds);
+      let id;
+      let pooledChannel;
+      if (this.idPool.length > 0) {
+        const pooled = this.idPool.shift();
+        id = pooled.id;
+        pooledChannel = pooled.channel;
+        this.refillPool();
+      } else {
+        id = await this.negotiator.reserveId("res-stream", excludedIds);
+      }
       excludedIds.add(id);
+      if (pooledChannel) {
+        preCreatedChannels.set(id, pooledChannel);
+      }
       streams.set(id, stream);
       return new StreamRef(id);
     });
@@ -828,10 +887,10 @@ var RTCFetcher = class {
     const sendStream = new SendStream(controller, this.config.minBufferSize);
     const streamReadyPromises = [];
     streams.forEach((stream, id) => {
-      const sChannel = this.pc.createDataChannel("res-stream", { negotiated: true, id });
+      const sChannel = preCreatedChannels.get(id) || this.pc.createDataChannel("res-stream", { negotiated: true, id });
       const sStream = new SendStream(sChannel, this.config.minBufferSize);
       stream.pipeTo(sStream.writable).catch((e) => console.error(e));
-      streamReadyPromises.push(this.negotiator.sendReady(id));
+      streamReadyPromises.push(this.negotiator.sendReady(id, "res-stream"));
     });
     await Promise.all(streamReadyPromises);
     try {
@@ -901,7 +960,7 @@ var RTCFetcher = class {
       const bodyBytes = await readExact(len);
       if (!bodyBytes) return null;
       const decoded = msgpackCodec.decode(bodyBytes);
-      if (decoded && typeof decoded === "object" && "label" in decoded) {
+      if (decoded && typeof decoded === "object") {
         return decoded;
       }
     } catch (e) {
@@ -912,28 +971,67 @@ var RTCFetcher = class {
     }
     return null;
   }
-  async fetch(label, body, _options) {
+  async fetch(label, body, options) {
+    if (options?.signal?.aborted) {
+      throw options.signal.reason || new Error("Aborted");
+    }
     await this.opened;
-    const reservedId = await this.negotiator.findUnusedId();
+    let reservedId;
+    let isPooled = false;
+    let pooledChannel;
+    if (this.idPool.length > 0) {
+      const pooled = this.idPool.shift();
+      reservedId = pooled.id;
+      pooledChannel = pooled.channel;
+      console.log(`[RTCFetcher] Using Pooled ID: ${reservedId}`);
+      isPooled = true;
+      this.refillPool();
+    } else {
+      console.log(`[RTCFetcher] Pool Empty. Negotiating directly...`);
+      reservedId = await this.negotiator.findUnusedId();
+      isPooled = false;
+    }
     const streams = /* @__PURE__ */ new Map();
     const streamCache = /* @__PURE__ */ new Map();
-    const excludedIds = /* @__PURE__ */ new Set([reservedId]);
+    const preCreatedStreamChannels = /* @__PURE__ */ new Map();
+    const excludedIds = /* @__PURE__ */ new Set([reservedId, ...this.idPool.map((p) => p.id)]);
     const processedBody = await this.traverseAndExtractStreams(body, async (stream) => {
       if (streamCache.has(stream)) return streamCache.get(stream);
-      const streamId = await this.negotiator.reserveId("stream", excludedIds);
+      let streamId;
+      if (this.idPool.length > 0) {
+        const p = this.idPool.shift();
+        streamId = p.id;
+        preCreatedStreamChannels.set(streamId, p.channel);
+        this.refillPool();
+      } else {
+        streamId = await this.negotiator.reserveId("stream", excludedIds);
+      }
       excludedIds.add(streamId);
       streams.set(streamId, stream);
       const ref = new StreamRef(streamId);
       streamCache.set(stream, ref);
       return ref;
     });
-    await this.negotiator.performHandshake(reservedId, "req::" + label);
+    if (!isPooled) {
+      await this.negotiator.performHandshake(reservedId, "req::" + label);
+    }
     console.log("Reserved ID (Local):", reservedId);
-    const mainChannel = this.pc.createDataChannel(label, { negotiated: true, id: reservedId });
+    const mainChannel = pooledChannel || this.pc.createDataChannel(label, { negotiated: true, id: reservedId });
     const controller = new DataChannelController(mainChannel);
+    const signal = options?.signal;
+    const abortHandler = () => {
+      console.log(`[RTCFetcher] AbortSignal fired. Closing request channel ${reservedId}`);
+      controller.close();
+    };
+    if (signal) {
+      signal.addEventListener("abort", abortHandler);
+      controller.underlyingChannel.addEventListener("close", () => {
+        signal.removeEventListener("abort", abortHandler);
+      });
+    }
     const responseReader = new ReceiveStream(controller);
     const sendStream = new SendStream(controller, this.config.minBufferSize);
-    await this.negotiator.sendReady(reservedId);
+    await this.negotiator.sendReady(reservedId, "req::" + label);
     const encoded = msgpackCodec.encode({ label, body: processedBody });
     if (controller.readyState !== "open") {
       await new Promise((resolve, reject) => {
@@ -955,10 +1053,10 @@ var RTCFetcher = class {
     }
     const streamReadyPromises = [];
     streams.forEach((stream, id) => {
-      const channel = this.pc.createDataChannel("stream", { negotiated: true, id });
+      const channel = preCreatedStreamChannels.get(id) || this.pc.createDataChannel("stream", { negotiated: true, id });
       const sStream = new SendStream(channel, this.config.minBufferSize);
       stream.pipeTo(sStream.writable).catch((e) => console.error(e));
-      streamReadyPromises.push(this.negotiator.sendReady(id));
+      streamReadyPromises.push(this.negotiator.sendReady(id, "stream"));
     });
     await Promise.all(streamReadyPromises);
     try {
