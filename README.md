@@ -53,6 +53,7 @@ try {
     const data = { message: "Hello", stream: myReadableStream };
     
     // 標準Fetch APIと同様に AbortSignal でタイムアウト制御が可能
+    // v0.6.2+: signal.abort() で即座に通信を切断し、リソースを解放します
     const controller = new AbortController();
     setTimeout(() => controller.abort(), 5000);
 
