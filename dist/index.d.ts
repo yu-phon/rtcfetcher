@@ -1,9 +1,13 @@
 interface IncomingRequest {
-    endpoint: string;
+    label: string;
     open(): Promise<{
-        req: object;
+        req: {
+            label: string;
+            body: any;
+        };
         res: {
             send: (data: any) => void;
+            close: () => void;
         };
     }>;
     reject(reason?: string): void;
@@ -27,6 +31,8 @@ declare class RTCResponse {
 
 interface RTCFetcherConfig {
     minBufferSize?: number;
+    prefetchPoolSize?: number;
+    incomingHighWaterMark?: number;
 }
 interface RTCFetchOptions {
     signal?: AbortSignal;
@@ -40,14 +46,18 @@ declare class RTCFetcher {
     private incomingRequestsController?;
     readonly opened: Promise<void>;
     private reservedChannels;
+    private idPool;
+    private pendingChannelQueue;
     constructor(pc: RTCPeerConnection, config?: RTCFetcherConfig);
+    private refillPool;
     private handleReservedChannel;
-    private processIncomingMessage;
+    private pumpIncomingRequests;
+    private createAndEnqueueRequest;
     private sendResponse;
     private processedIncomingBody;
     private getOrOpenChannel;
     private bufferAndDecode;
-    fetch(label: string, body: any, _options?: RTCFetchOptions): Promise<RTCResponse>;
+    fetch(label: string, body: any, options?: RTCFetchOptions): Promise<RTCResponse>;
     private traverseAndExtractStreams;
 }
 
@@ -60,7 +70,7 @@ declare class Negotiator {
     private waitingForReady;
     onReserved?: (id: number, channel?: RTCDataChannel, label?: string) => void;
     constructor(signalingChannel: RTCDataChannel, pc: RTCPeerConnection);
-    sendReady(id: number): Promise<void>;
+    sendReady(id: number, label?: string): Promise<void>;
     /**
      * Reserve a new DataChannel ID.
      * Uses getStats to find an unused ID, then performs a handshake with the peer.

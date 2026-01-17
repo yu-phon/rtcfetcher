@@ -1,6 +1,6 @@
 {
   "name": "@yuphon/rtcfetcher",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "WebRTC Fetch API implementation",
   "main": "dist/index.js",
   "module": "dist/index.mjs",

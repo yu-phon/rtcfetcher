@@ -52,8 +52,8 @@ describe('RTCFetcher', () => {
         mockReserveId.mockImplementation(() => Promise.resolve(idCounter++));
 
         // Access the mock instance
-        const NegotiatorMock = require('../../../negotiation/id-negotiator').Negotiator;
-        NegotiatorMock.mockImplementation(() => {
+        const { Negotiator } = jest.requireMock('../../../negotiation/id-negotiator');
+        Negotiator.mockImplementation(() => {
             return {
                 onReserved: null,
                 reserveId: mockReserveId,
@@ -76,7 +76,7 @@ describe('RTCFetcher', () => {
         // We need to mock internal traverseStreams too or pass simple body.
 
         // Mock private method traverseAndExtractStreams to just return body
-        (fetcher as any).traverseAndExtractStreams = jest.fn((body, replacer) => Promise.resolve(body));
+        (fetcher as any).traverseAndExtractStreams = jest.fn((body, _replacer) => Promise.resolve(body));
 
         // Mock sendResponse to avoid errors
         (fetcher as any).sendResponse = jest.fn();

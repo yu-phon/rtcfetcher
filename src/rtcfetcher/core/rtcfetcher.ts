@@ -24,11 +24,7 @@ interface PooledChannel {
     channel: RTCDataChannel;
 }
 
-interface PendingRequest {
-    label: string;
-    channel: RTCDataChannel;
-    resolve: () => void; // Triggered when fully accepted/consumed? No, triggering open logic.
-}
+
 
 export class RTCFetcher {
     private negotiator: Negotiator;
@@ -350,7 +346,10 @@ export class RTCFetcher {
         return null;
     }
 
-    public async fetch(label: string, body: any, _options?: RTCFetchOptions): Promise<RTCResponse> {
+    public async fetch(label: string, body: any, options?: RTCFetchOptions): Promise<RTCResponse> {
+        if (options?.signal?.aborted) {
+            throw options.signal.reason || new Error('Aborted');
+        }
         await this.opened;
 
         let reservedId: number;
@@ -408,6 +407,20 @@ export class RTCFetcher {
         console.log("Reserved ID (Local):", reservedId);
         const mainChannel = pooledChannel || this.pc.createDataChannel(label, { negotiated: true, id: reservedId });
         const controller = new DataChannelController(mainChannel);
+
+        // Abort Logic
+        const signal = options?.signal;
+        const abortHandler = () => {
+            console.log(`[RTCFetcher] AbortSignal fired. Closing request channel ${reservedId}`);
+            controller.close();
+        };
+        if (signal) {
+            signal.addEventListener('abort', abortHandler);
+            // Cleanup listener on close? 
+            controller.underlyingChannel.addEventListener('close', () => {
+                signal.removeEventListener('abort', abortHandler);
+            });
+        }
 
         const responseReader = new ReceiveStream(controller);
         const sendStream = new SendStream(controller, this.config.minBufferSize);
