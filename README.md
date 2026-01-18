@@ -61,7 +61,18 @@ try {
         signal: controller.signal
     });
 
+    const res = await fetcher.fetch("my-endpoint", data, {
+        signal: controller.signal
+    });
+
     if (res.ok) {
+        // 1. レスポンス内のストリームへ直感的にアクセス (Proxy)
+        // 入れ子になったプロパティでも、StreamRef は自動的に ReadableStream に変換されます
+        const stream = res.stream; 
+        // const reader = stream.getReader(); ...
+
+        // 2. または、json() で全データを自動受信 (Auto-Buffering)
+        // ストリームが含まれていても、全て自動的にバッファリング・展開されます
         const result = await res.json();
         console.log("Success:", result);
     }
@@ -100,6 +111,46 @@ while (true) {
     // レスポンスを返す
     res.send({ status: "processed", feedback: "ok" });
 }
+```
+
+### Header & Body Separation (Two-Stage Await)
+
+`RTCFetcher` は標準Fetch APIと同様に、**ヘッダー（軽量なメタデータ）** と **ボディ（大容量データやストリーム）** の受信を分離できます。
+これにより、大容量データの転送を待つことなく `status` や `meta` 情報を即座に確認できます。
+
+**(1) Server Side (Sending)**
+ヘッダー情報と、Auto-Streamingの対象となる大容量データ（または `ReadableStream`）を同時に返します。重いデータは自動的に「参照(StreamRef)」に変換されるため、ネットワーク上では軽量なメッセージとして即座に送信されます。
+
+```javascript
+// (受信側からのリクエスト処理中...)
+res.send({
+    // --- Header (即座に届く) ---
+    status: 200,
+    meta: { type: 'video', length: 1024 * 1024 * 100 },
+
+    // --- Body (参照のみ届く・データは後から) ---
+    // 16KBを超えるデータは自動的にストリーム化されます
+    body: hugeUint8ArrayData 
+});
+```
+
+**(2) Client Side (Receiving)**
+`fetch` の完了時点ではまだ重いデータの転送は始まっておらず、メインチャンネルの帯域も消費していません。
+
+```javascript
+// Step 1: ヘッダー情報の受信 (await fetch)
+// 重いデータはまだ転送されません。
+const res = await fetcher.fetch("endpoint", { ... });
+
+// ここでステータスチェックなどを即座に行えます
+if (res.status !== 200 || res.meta.type !== 'video') {
+    throw new Error("Invalid response");
+}
+
+// Step 2: ボディの実転送 (await json)
+// ここではじめてストリーム接続が確立され、データ転送が開始されます
+const data = await res.json(); 
+console.log(data.body); // -> 全データ受信完了後に解決
 ```
 
 ## API Reference

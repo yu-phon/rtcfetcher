@@ -96,6 +96,31 @@ function setupReceiver() {
                 const { req: requestData, res } = await req.open();
                 // log(2, 'Request Body:', requestData.body);
 
+                if (requestData.label === 'proxy-test') {
+                    // Echo body for proxy test
+                    log(2, 'Echoing proxy-test body');
+                    res.send(requestData.body);
+                    continue;
+                }
+
+                if (requestData.label === 'two-step-test') {
+                    log(2, 'Handling two-step-test request');
+
+                    // Respond with Header + Body (Stream)
+                    const largeBody = new Uint8Array(1024 * 1024); // 1MB
+                    largeBody.fill(1); // Fill with data
+
+                    res.send({
+                        // Header (Immediate)
+                        status: 200,
+                        headerField: "header-value",
+
+                        // Body (Streamed) - Auto-streaming > 16KB
+                        bodyStream: largeBody
+                    });
+                    continue;
+                }
+
                 // Consume streams if present
                 const body = requestData.body;
                 if (body && typeof body === 'object') {
@@ -153,6 +178,8 @@ connectBtn.addEventListener('click', async () => {
         sendStreamBtn.disabled = false;
         sendLargeBtn.disabled = false;
         sendMtuStreamBtn.disabled = false;
+        proxyTestBtn.disabled = false;
+        verifyTwoStepBtn.disabled = false;
     } catch (e) {
         log(1, 'Connection failed', e);
     }
@@ -280,5 +307,124 @@ sendMtuStreamBtn.addEventListener('click', async () => {
         log(1, `MTU Stream Test Complete in ${duration}ms`, json);
     } catch (e) {
         log(1, 'MTU Stream Test Error', e);
+    }
+});
+
+// Proxy & Auto-Buffer Test
+const proxyTestBtn = document.getElementById('proxyTestBtn') as HTMLButtonElement;
+proxyTestBtn.addEventListener('click', async () => {
+    try {
+        log(1, 'Starting Proxy & Auto-Buffer Test...');
+
+        // Create a nested stream structure
+        const stream = new ReadableStream({
+            start(controller) {
+                controller.enqueue(new TextEncoder().encode("StreamContent"));
+                controller.close();
+            }
+        });
+
+        const payload = {
+            meta: {
+                id: 123,
+                myStream: stream
+            },
+            topLevel: "foo"
+        };
+
+        log(1, 'Sending Nested Request', { topLevel: "foo", meta: { id: 123, myStream: "[ReadableStream]" } });
+
+        // 1. Test Proxy Access (Direct Property)
+        const res1 = await fetcher1.fetch('proxy-test', payload);
+        log(1, 'Fetch 1 Complete (Proxy Access Test)');
+
+        // Access nested property directly
+        // @ts-ignore - Dynamic property access on proxy
+        const directStream = res1.meta.myStream;
+
+        if (directStream instanceof ReadableStream) {
+            log(1, 'SUCCESS: res.meta.myStream IS a ReadableStream! Reading it...');
+            const reader = directStream.getReader();
+            const { value } = await reader.read();
+            log(1, `Read value: ${new TextDecoder().decode(value)}`);
+            reader.releaseLock(); // Important: release to allow json() to read remainder if any (but here we read all)
+        } else {
+            log(1, 'FAILURE: res.meta.myStream is NOT a ReadableStream', directStream);
+        }
+
+        // 2. Test Auto-Buffering (json())
+        // Re-send because stream was consumed above
+        const stream2 = new ReadableStream({
+            start(controller) {
+                controller.enqueue(new TextEncoder().encode("StreamContent2"));
+                controller.close();
+            }
+        });
+        const payload2 = {
+            meta: {
+                id: 456,
+                myStream: stream2
+            },
+        };
+
+        log(1, 'Fetch 2 (JSON Buffer Test)...');
+        const res2 = await fetcher1.fetch('proxy-test', payload2);
+
+        const bufferedJson = await res2.json();
+        log(1, 'SUCCESS: res2.json() returned:', bufferedJson);
+
+        // Check if stream was converted to Uint8Array (or decoded string? Implementation does Uint8Array)
+        // @ts-ignore
+        const buf = bufferedJson.meta.myStream;
+        if (buf instanceof Uint8Array) {
+            log(1, `SUCCESS: bufferedJson.meta.myStream is Uint8Array of length ${buf.byteLength}`);
+            log(1, `Content: ${new TextDecoder().decode(buf)}`);
+        } else {
+            log(1, 'FAILURE: bufferedJson.meta.myStream is not Uint8Array', buf);
+        }
+
+    } catch (e) {
+        log(1, 'Proxy Test Error', e);
+    }
+});
+
+// Verify 2-Step Await (Header vs Body)
+const verifyTwoStepBtn = document.getElementById('verifyTwoStepBtn') as HTMLButtonElement;
+verifyTwoStepBtn.addEventListener('click', async () => {
+    try {
+        log(1, 'Starting 2-Step Await Verification...');
+
+        // 1. Send request
+        // The receiver will respond with a header and a slow stream
+        const response = await fetcher1.fetch('two-step-test', {});
+
+        // 2. First Await: Fetch resolve
+        log(1, '✅ Step 1: Fetch Resolved! (Headers received)');
+
+        // Check headers (available immediately)
+        if (response.ok && (response as any).headerField === 'header-value') {
+            log(1, '   -> Successfully accessed header field:', (response as any).headerField);
+        } else {
+            log(1, '   -> Failed to access header field!');
+        }
+
+        log(1, '   (Waiting 2 seconds to fail if stream starts automatically...)');
+        await new Promise(r => setTimeout(r, 2000));
+        log(1, '   -> 2 seconds passed. Starting Step 2...');
+
+        // 3. Second Await: JSON (Body Stream)
+        // This triggers the actual stream transfer
+        const start = Date.now();
+        const json = await response.json();
+        const duration = Date.now() - start;
+
+        log(1, `✅ Step 2: JSON Resolved! (Body received in ${duration}ms)`);
+
+        // @ts-ignore
+        const bodySize = json.bodyStream ? json.bodyStream.byteLength : 0;
+        log(1, `   -> Body Size: ${bodySize} bytes`);
+
+    } catch (e) {
+        log(1, '2-Step Verification Error', e);
     }
 });
