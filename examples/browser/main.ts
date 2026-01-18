@@ -96,6 +96,13 @@ function setupReceiver() {
                 const { req: requestData, res } = await req.open();
                 // log(2, 'Request Body:', requestData.body);
 
+                if (requestData.label === 'proxy-test') {
+                    // Echo body for proxy test
+                    log(2, 'Echoing proxy-test body');
+                    res.send(requestData.body);
+                    continue;
+                }
+
                 // Consume streams if present
                 const body = requestData.body;
                 if (body && typeof body === 'object') {
@@ -153,6 +160,7 @@ connectBtn.addEventListener('click', async () => {
         sendStreamBtn.disabled = false;
         sendLargeBtn.disabled = false;
         sendMtuStreamBtn.disabled = false;
+        proxyTestBtn.disabled = false;
     } catch (e) {
         log(1, 'Connection failed', e);
     }
@@ -280,5 +288,83 @@ sendMtuStreamBtn.addEventListener('click', async () => {
         log(1, `MTU Stream Test Complete in ${duration}ms`, json);
     } catch (e) {
         log(1, 'MTU Stream Test Error', e);
+    }
+});
+
+// Proxy & Auto-Buffer Test
+const proxyTestBtn = document.getElementById('proxyTestBtn') as HTMLButtonElement;
+proxyTestBtn.addEventListener('click', async () => {
+    try {
+        log(1, 'Starting Proxy & Auto-Buffer Test...');
+
+        // Create a nested stream structure
+        const stream = new ReadableStream({
+            start(controller) {
+                controller.enqueue(new TextEncoder().encode("StreamContent"));
+                controller.close();
+            }
+        });
+
+        const payload = {
+            meta: {
+                id: 123,
+                myStream: stream
+            },
+            topLevel: "foo"
+        };
+
+        log(1, 'Sending Nested Request', { topLevel: "foo", meta: { id: 123, myStream: "[ReadableStream]" } });
+
+        // 1. Test Proxy Access (Direct Property)
+        const res1 = await fetcher1.fetch('proxy-test', payload);
+        log(1, 'Fetch 1 Complete (Proxy Access Test)');
+
+        // Access nested property directly
+        // @ts-ignore - Dynamic property access on proxy
+        const directStream = res1.meta.myStream;
+
+        if (directStream instanceof ReadableStream) {
+            log(1, 'SUCCESS: res.meta.myStream IS a ReadableStream! Reading it...');
+            const reader = directStream.getReader();
+            const { value } = await reader.read();
+            log(1, `Read value: ${new TextDecoder().decode(value)}`);
+            reader.releaseLock(); // Important: release to allow json() to read remainder if any (but here we read all)
+        } else {
+            log(1, 'FAILURE: res.meta.myStream is NOT a ReadableStream', directStream);
+        }
+
+        // 2. Test Auto-Buffering (json())
+        // Re-send because stream was consumed above
+        const stream2 = new ReadableStream({
+            start(controller) {
+                controller.enqueue(new TextEncoder().encode("StreamContent2"));
+                controller.close();
+            }
+        });
+        const payload2 = {
+            meta: {
+                id: 456,
+                myStream: stream2
+            },
+        };
+
+        log(1, 'Fetch 2 (JSON Buffer Test)...');
+        const res2 = await fetcher1.fetch('proxy-test', payload2);
+
+        const bufferedJson = await res2.json();
+        log(1, 'SUCCESS: res2.json() returned:', bufferedJson);
+
+        // Check if stream was converted to Uint8Array (or decoded string? Implementation does Uint8Array)
+        // @ts-ignore
+        const buf = bufferedJson.meta.myStream;
+        if (buf instanceof Uint8Array) {
+            log(1, `SUCCESS: bufferedJson.meta.myStream is Uint8Array of length ${buf.byteLength}`);
+            log(1, `Content: ${new TextDecoder().decode(buf)}`);
+        } else {
+            log(1, 'FAILURE: bufferedJson.meta.myStream is not Uint8Array', buf);
+        }
+
+    } catch (e) {
+        log(1, 'Proxy Test Error', e);
     }
 });

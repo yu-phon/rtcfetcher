@@ -61,7 +61,18 @@ try {
         signal: controller.signal
     });
 
+    const res = await fetcher.fetch("my-endpoint", data, {
+        signal: controller.signal
+    });
+
     if (res.ok) {
+        // 1. レスポンス内のストリームへ直感的にアクセス (Proxy)
+        // 入れ子になったプロパティでも、StreamRef は自動的に ReadableStream に変換されます
+        const stream = res.stream; 
+        // const reader = stream.getReader(); ...
+
+        // 2. または、json() で全データを自動受信 (Auto-Buffering)
+        // ストリームが含まれていても、全て自動的にバッファリング・展開されます
         const result = await res.json();
         console.log("Success:", result);
     }
