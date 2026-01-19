@@ -3,7 +3,8 @@ import { Negotiator } from '../../negotiation/id-negotiator';
 import { SendStream } from '../../datachannelstream/streams/sendStream';
 import { ReceiveStream } from '../../datachannelstream/streams/receiveStream';
 import { DataChannelController } from '../../datachannelstream/framing/channel-controller';
-import { msgpackCodec } from '../utils/msgpack-codec';
+import { QpackCodec } from '../qpack/qpack-codec';
+import { QpackContext } from '../qpack/qpack-context';
 import { StreamRef } from '../types/stream-ref';
 import { IncomingRequest } from '../types/message';
 import { RTCResponse } from './rtc-response';
@@ -24,12 +25,16 @@ interface PooledChannel {
     channel: RTCDataChannel;
 }
 
-
-
 export class RTCFetcher {
     private negotiator: Negotiator;
     private masterChannel: RTCDataChannel;
     private readonly config: RTCFetcherConfig;
+
+    // QPACK
+    private qpackContext: QpackContext;
+    private qpackCodec: QpackCodec;
+    private qpackEncoderStream: RTCDataChannel;
+    private qpackDecoderStream: RTCDataChannel;
 
     // Stream exposing incoming requests
     readonly incomingRequests: ReadableStream<IncomingRequest>;
@@ -55,6 +60,19 @@ export class RTCFetcher {
         this.masterChannel = pc.createDataChannel('rtc-fetcher-master', { negotiated: true, id: 0 });
         this.negotiator = new Negotiator(this.masterChannel, pc);
 
+        // QPACK Control Channels (ID 1 & 2)
+        // Note: We need to agree on IDs. Let's use 1=Encoder, 2=Decoder.
+        // Assuming Master=0. 
+        this.qpackEncoderStream = pc.createDataChannel('qpack-encoder', { negotiated: true, id: 1 });
+        this.qpackDecoderStream = pc.createDataChannel('qpack-decoder', { negotiated: true, id: 2 });
+
+        this.qpackContext = new QpackContext();
+        // Encoder Logic writes to encoderStream, reads from decoderStream
+        this.qpackContext.attachChannels(this.qpackEncoderStream, this.qpackDecoderStream);
+
+        this.qpackCodec = new QpackCodec(this.qpackContext);
+
+
         this.incomingRequests = new ReadableStream<IncomingRequest>({
             start: (controller) => {
                 this.incomingRequestsController = controller;
@@ -71,7 +89,10 @@ export class RTCFetcher {
 
         this.opened = new Promise<void>((resolve) => {
             const checkOpen = () => {
-                if (this.masterChannel.readyState === 'open') {
+                if (this.masterChannel.readyState === 'open' &&
+                    this.qpackEncoderStream.readyState === 'open' &&
+                    this.qpackDecoderStream.readyState === 'open') {
+
                     // Start filling the pool once connected
                     this.refillPool();
                     resolve();
@@ -81,7 +102,10 @@ export class RTCFetcher {
             };
 
             if (!checkOpen()) {
-                this.masterChannel.onopen = () => checkOpen();
+                const handler = () => checkOpen();
+                this.masterChannel.addEventListener('open', handler);
+                this.qpackEncoderStream.addEventListener('open', handler);
+                this.qpackDecoderStream.addEventListener('open', handler);
             }
         });
     }
@@ -95,8 +119,9 @@ export class RTCFetcher {
 
         while (this.idPool.length < targetSize) {
             try {
-                // Determine excluded IDs: Reserved Channels + Current Pool + (Negotiator checks used)
-                const excluded = new Set<number>([...this.reservedChannels.keys(), ...this.idPool.map(p => p.id)]);
+                // Determine excluded IDs: Reserved Channels + Current Pool + (Negotiator checks used).
+                // IMPORTANT: Exclude QPACK channels (1, 2)
+                const excluded = new Set<number>([1, 2, ...this.reservedChannels.keys(), ...this.idPool.map(p => p.id)]);
 
                 // Reserve with generic label. Real label is sent via ID-Negotiator's updated sendReady
                 const id = await this.negotiator.reserveId('__pooled__', excluded);
@@ -241,7 +266,7 @@ export class RTCFetcher {
             return new StreamRef(id);
         });
 
-        const encoded = msgpackCodec.encode(processed);
+        const encoded = this.qpackCodec.encode(processed);
         // Reuse controller
         const sendStream = new SendStream(controller, this.config.minBufferSize);
 
@@ -333,7 +358,7 @@ export class RTCFetcher {
             const bodyBytes = await readExact(len);
             if (!bodyBytes) return null;
 
-            const decoded = msgpackCodec.decode(bodyBytes);
+            const decoded = this.qpackCodec.decode(bodyBytes);
             if (decoded && typeof decoded === 'object') {
                 return decoded;
             }
@@ -428,7 +453,7 @@ export class RTCFetcher {
         // 6. Signal Channel Ready
         await this.negotiator.sendReady(reservedId, 'req::' + label);
 
-        const encoded = msgpackCodec.encode({ label, body: processedBody });
+        const encoded = this.qpackCodec.encode({ label, body: processedBody });
 
         if (controller.readyState !== 'open') {
             await new Promise<void>((resolve, reject) => {
@@ -485,7 +510,7 @@ export class RTCFetcher {
                     const len = new DataView(lenBuf.buffer).getUint32(0, true);
                     const bodyBuf = await readExact(len);
 
-                    const resData = msgpackCodec.decode(bodyBuf);
+                    const resData = this.qpackCodec.decode(bodyBuf);
                     resolve(new RTCResponse(resData, (ref) => {
                         return new ReadableStream({
                             start: (c) => {

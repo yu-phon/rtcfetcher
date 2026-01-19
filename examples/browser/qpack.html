@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RTCFetcher QPACK Test</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 20px;
+            background-color: #f4f4f4;
+        }
+
+        h1 {
+            color: #333;
+        }
+
+        .container {
+            display: flex;
+            gap: 20px;
+        }
+
+        .panel {
+            flex: 1;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+
+        .log-area {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 10px;
+            height: 400px;
+            overflow-y: auto;
+            font-family: 'Consolas', monospace;
+            font-size: 13px;
+            white-space: pre-wrap;
+            border-radius: 4px;
+        }
+
+        button {
+            padding: 8px 16px;
+            background-color: #0078d4;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-right: 8px;
+            margin-bottom: 8px;
+        }
+
+        button:hover {
+            background-color: #106ebe;
+        }
+
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+
+        .controls {
+            margin-bottom: 20px;
+        }
+
+        .section-title {
+            font-weight: bold;
+            margin-bottom: 10px;
+            color: #555;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>RTCFetcher QPACK Verification</h1>
+    <a href="index.html">Back to Main Test</a>
+    <hr>
+
+    <div class="controls">
+        <button id="connectBtn">1. Connect DataChannels</button>
+    </div>
+
+    <div class="container">
+        <div class="panel">
+            <div class="section-title">Sender (Client)</div>
+            <div class="controls">
+                <button id="sendFlatBtn" disabled>Send Flat Object</button>
+                <button id="sendDeepBtn" disabled>Send Deeply Nested</button>
+                <button id="sendArrayBtn" disabled>Send with Arrays</button>
+                <button id="sendMixedBtn" disabled>Send Mixed (Stream+Meta)</button>
+            </div>
+            <div id="log1" class="log-area"></div>
+        </div>
+        <div class="panel">
+            <div class="section-title">Receiver (Server)</div>
+            <div id="log2" class="log-area"></div>
+        </div>
+    </div>
+
+    <script type="module" src="./qpack-test.ts"></script>
+</body>
+
+</html>
