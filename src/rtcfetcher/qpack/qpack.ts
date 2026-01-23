@@ -11,23 +11,9 @@ export interface Header {
 
 export function encodeQpack(headers: Header[], context?: QpackContext): Uint8Array {
     const out: number[] = [];
+    const ops: { type: 'indexed' | 'literal_nameref' | 'literal', index?: number, name?: string, value?: string, static?: boolean }[] = [];
 
-    // Prefix Calculation
-    // Required Insert Count: Needs to effectively "lock" the state required for this block.
-    // If we use dynamic table entries, we must specify the `ReqInsertCount` that covers those entries.
-    // For now, if we insert new items *during* this encoding, we might increment.
-
-    // Simplification: We will try to create dynamic entries for repeated items, 
-    // OR we will reference existing ones.
-
-    let requiredInsertCount = 0;
-    // Delta Base = ReqInsertCount (S=0, Sign=+) for simplicity if we don't do complex delta logic.
-
-    const fieldLines: number[] = [];
-
-    // We need to determine ReqInsertCount before writing the prefix.
-    // So we assume we encode first, tracking max index used.
-
+    // Pass 1: Determine Insertions and Indices
     let maxDynamicIndexUsed = -1; // -1 means none
 
     for (const h of headers) {
@@ -38,7 +24,6 @@ export function encodeQpack(headers: Header[], context?: QpackContext): Uint8Arr
         let bestStaticIndex = -1;
         let bestStaticNameMatch = -1;
 
-        // Note: This is O(N) scan. 
         for (let i = 0; i < qpack_static_table_entries.length; i++) {
             const entry = qpack_static_table_entries[i];
             if (entry[0] === nameLc) {
@@ -50,8 +35,7 @@ export function encodeQpack(headers: Header[], context?: QpackContext): Uint8Arr
             }
         }
 
-        // 2. Dynamic Table Search (if context available)
-        // We check remoteTable because that represents what the Encoder (us) has sent/established.
+        // 2. Dynamic Table Search
         let bestDynamicIndex = -1; // Absolute Index
         let bestDynamicNameMatch = -1; // Absolute Index
 
@@ -64,139 +48,87 @@ export function encodeQpack(headers: Header[], context?: QpackContext): Uint8Arr
         }
 
         // Decision Logic
-        // Prefer Full Match (Static > Dynamic usually, but Static is cheaper)
-
         if (bestStaticIndex !== -1) {
-            // Indexed Field Line (Static)
-            // 1Txxxxxx, T=1
-            const enc = encodeInt(bestStaticIndex, 6);
-            fieldLines.push(0x80 | 0x40 | enc[0], ...enc.slice(1));
+            ops.push({ type: 'indexed', index: bestStaticIndex, static: true });
             continue;
         }
 
         if (bestDynamicIndex !== -1) {
-            // Indexed Field Line (Dynamic)
-            // 1Txxxxxx, T=0
-            // Index needs to be Relative.
-            // Relative Index = Base - 1 - Absolute Index
-            // Let Base be current Insert Count (of remote table)
-            const currentInsertCount = context!.remoteTable.getInsertedCount();
-
-            // To reference this, we need 'ReqInsertCount' to be at least (AbsoluteIndex + 1)
-            // maxDynamicIndexUsed tracks the max absolute index we reference.
-            if (bestDynamicIndex > maxDynamicIndexUsed) {
-                maxDynamicIndexUsed = bestDynamicIndex;
-            }
-
-            // Base = ReqInsertCount (Simplest strategy)
-            // But we need to decide Base properly.
-            // RFC: Base Index is the value of the 'Insert Count' ...
-            // Let's use Base = currentInsertCount.
-
-            const relativeIndex = currentInsertCount - 1 - bestDynamicIndex;
-            const enc = encodeInt(relativeIndex, 6);
-            fieldLines.push(0x80 | 0x00 | enc[0], ...enc.slice(1));
+            if (bestDynamicIndex > maxDynamicIndexUsed) maxDynamicIndexUsed = bestDynamicIndex;
+            ops.push({ type: 'indexed', index: bestDynamicIndex, static: false });
             continue;
         }
 
-        // No Full Match.
-        // Should we insert into Dynamic Table?
-        // Heuristic: If we have context, and it's not a StreamRef, insert it.
-        // (StreamRefs are unique, bad for compression)
         const isStreamRef = valueStr.startsWith("::streamref::");
-
         if (context && !isStreamRef) {
-            // Insert into Dynamic Table
-            // This sends instruction on dedicated stream
+            // Insert
             const absIndex = context.insertToDynamicTable(nameLc, valueStr);
-
-            // And now we reference it immediately as a POST-BASE Index? 
-            // Or just reference it normally if we assume it's "in the table" for this block?
-            // "The encoder ADDS the entry to the dynamic table... effectively sending the instruction."
-            // The Header Block can reference it.
-
-            if (absIndex > maxDynamicIndexUsed) {
-                maxDynamicIndexUsed = absIndex;
-            }
-
-            // Use Indexed Field Line (Dynamic)
-            const currentInsertCount = context.remoteTable.getInsertedCount();
-            const relativeIndex = currentInsertCount - 1 - absIndex;
-            // Since we just inserted, relativeIndex should be 0 (if Base == currentCount)
-
-            const enc = encodeInt(relativeIndex, 6);
-            fieldLines.push(0x80 | enc[0], ...enc.slice(1));
+            if (absIndex > maxDynamicIndexUsed) maxDynamicIndexUsed = absIndex;
+            ops.push({ type: 'indexed', index: absIndex, static: false });
             continue;
         }
 
         // Fallback: Literal
-
-        // Name Reference?
         if (bestStaticNameMatch !== -1) {
-            // Literal with Name Ref (Static)
-            // 01N0xxxx, N=1 (Static)
-            const enc = encodeInt(bestStaticNameMatch, 4);
-            fieldLines.push(0x40 | 0x10 | enc[0], ...enc.slice(1));
-
-            const valBytes = new TextEncoder().encode(valueStr);
-            const valLen = encodeInt(valBytes.length, 7);
-            fieldLines.push(...valLen, ...valBytes);
-        }
-        else if (bestDynamicNameMatch !== -1) {
-            // Literal with Name Ref (Dynamic)
-            // 01N0xxxx, N=0 (Dynamic)
-            // Check ReqInsertCount
+            ops.push({ type: 'literal_nameref', index: bestStaticNameMatch, static: true, value: valueStr });
+        } else if (bestDynamicNameMatch !== -1) {
             if (bestDynamicNameMatch > maxDynamicIndexUsed) maxDynamicIndexUsed = bestDynamicNameMatch;
-
-            const currentInsertCount = context!.remoteTable.getInsertedCount();
-            const relativeIndex = currentInsertCount - 1 - bestDynamicNameMatch;
-
-            const enc = encodeInt(relativeIndex, 4);
-            fieldLines.push(0x40 | 0x00 | enc[0], ...enc.slice(1));
-
-            const valBytes = new TextEncoder().encode(valueStr);
-            const valLen = encodeInt(valBytes.length, 7);
-            fieldLines.push(...valLen, ...valBytes);
-        }
-        else {
-            // Literal with Literal Name
-            // 0010xxxx
-            const nameBytes = new TextEncoder().encode(nameLc);
-            const nameLen = encodeInt(nameBytes.length, 3);
-            fieldLines.push(0x20 | nameLen[0], ...nameLen.slice(1), ...nameBytes);
-
-            const valBytes = new TextEncoder().encode(valueStr);
-            const valLen = encodeInt(valBytes.length, 7);
-            fieldLines.push(...valLen, ...valBytes);
+            ops.push({ type: 'literal_nameref', index: bestDynamicNameMatch, static: false, value: valueStr });
+        } else {
+            ops.push({ type: 'literal', name: nameLc, value: valueStr });
         }
     }
 
-    // Calc Prefix
-    // maxDynamicIndexUsed is 0-based absolute index.
-    // Required Insert Count = maxDynamicIndexUsed + 1
-    requiredInsertCount = (maxDynamicIndexUsed === -1) ? 0 : (maxDynamicIndexUsed + 1);
+    // Pass 2: Encode Logic
+    const requiredInsertCount = (maxDynamicIndexUsed === -1) ? 0 : (maxDynamicIndexUsed + 1);
+    const baseIndex = requiredInsertCount; // Base = RIC (S=0, Delta=0)
 
-    // Wire RIC
-    // RFC 4.5.1: Encoded Required Insert Count
-    // If RIC == 0, wire is 0.
-    // If RIC > 0, wire is (RIC % (2*MaxEntries)) + 1 ? No, just RIC.
-    // "The value is encoded as an integer with an 8-bit prefix."
-
-    // Base Delta
-    // Base Index = ReqInsertCount.
-    // Delta Base = Base Index - ReqInsertCount = 0.
-    // Sign = 0 (+)
-
-    // Prefix Byte 1: Required Insert Count
+    // Prefix
     const ricEnc = encodeInt(requiredInsertCount, 8);
     out.push(...ricEnc);
-
-    // Prefix Byte 2+: Delta Base
-    // 0Sxxxxxx (S=0)
-    const dbEnc = encodeInt(0, 7);
+    const dbEnc = encodeInt(0, 7); // Delta Base 0, Sign +
     out.push(0x00 | dbEnc[0], ...dbEnc.slice(1));
 
-    out.push(...fieldLines);
+    // Field Lines
+    for (const op of ops) {
+        if (op.type === 'indexed') {
+            if (op.static) {
+                // 1Txxxxxx, T=1
+                const enc = encodeInt(op.index!, 6);
+                out.push(0x80 | 0x40 | enc[0], ...enc.slice(1));
+            } else {
+                // 1Txxxxxx, T=0
+                // Relative = Base - 1 - Abs
+                const relativeIndex = baseIndex - 1 - op.index!;
+                const enc = encodeInt(relativeIndex, 6);
+                out.push(0x80 | 0x00 | enc[0], ...enc.slice(1));
+            }
+        } else if (op.type === 'literal_nameref') {
+            if (op.static) {
+                // 01N0xxxx, N=1
+                const enc = encodeInt(op.index!, 4);
+                out.push(0x40 | 0x10 | enc[0], ...enc.slice(1));
+            } else {
+                // 01N0xxxx, N=0
+                const relativeIndex = baseIndex - 1 - op.index!;
+                const enc = encodeInt(relativeIndex, 4);
+                out.push(0x40 | 0x00 | enc[0], ...enc.slice(1));
+            }
+            const valBytes = new TextEncoder().encode(op.value!);
+            const valLen = encodeInt(valBytes.length, 7);
+            out.push(...valLen, ...valBytes);
+        } else {
+            // Literal
+            // 0010xxxx
+            const nameBytes = new TextEncoder().encode(op.name!);
+            const nameLen = encodeInt(nameBytes.length, 3);
+            out.push(0x20 | nameLen[0], ...nameLen.slice(1), ...nameBytes);
+
+            const valBytes = new TextEncoder().encode(op.value!);
+            const valLen = encodeInt(valBytes.length, 7);
+            out.push(...valLen, ...valBytes);
+        }
+    }
 
     return new Uint8Array(out);
 }
@@ -260,6 +192,7 @@ export function decodeQpack(buf: Uint8Array, context?: QpackContext): Header[] {
                 if (!context) throw new Error("QPACK Dynamic Entry without Context");
                 const entry = context.localTable.getEntry(absIndex);
                 if (!entry) throw new Error(`QPACK Dynamic Entry Not Found: Abs ${absIndex}`);
+                // console.log(`[decodeQpack] Indexed Dynamic: ${entry.name} = ${entry.value}`);
                 headers.push({ name: entry.name, value: entry.value });
             }
             continue;

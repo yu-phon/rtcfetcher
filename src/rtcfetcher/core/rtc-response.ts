@@ -1,17 +1,24 @@
 import { StreamRef } from '../types/stream-ref';
 
+export interface RTCResponseStats {
+    encodedSize: number;
+}
+
 export class RTCResponse {
     private _body: any;
     private _streamReplacer: (ref: StreamRef) => ReadableStream<Uint8Array> | null;
+    private _stats?: RTCResponseStats;
     // Cache for rehydrated streams to ensure we return the same instance
     private _streamCache: Map<number, ReadableStream<Uint8Array>> = new Map();
 
     constructor(
         body: any,
-        streamReplacer: (ref: StreamRef) => ReadableStream<Uint8Array> | null
+        streamReplacer: (ref: StreamRef) => ReadableStream<Uint8Array> | null,
+        stats?: RTCResponseStats
     ) {
         this._body = body;
         this._streamReplacer = streamReplacer;
+        this._stats = stats;
 
         // Return a proxy to handle arbitrary property access
         return new Proxy(this, {
@@ -64,6 +71,10 @@ export class RTCResponse {
         }
         this._streamCache.set(ref.id, stream);
         return stream;
+    }
+
+    get qpackStats(): RTCResponseStats | undefined {
+        return this._stats;
     }
 
     get ok(): boolean {

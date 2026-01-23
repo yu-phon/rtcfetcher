@@ -1,4 +1,4 @@
-
+import { ICodec } from '../core/interfaces';
 import { encodeQpack, decodeQpack, Header } from './qpack'; // Update qpack.ts exports later
 import { StreamRef } from '../types/stream-ref';
 import { RTCSerializationError } from '../errors/rtc-fetcher-error';
@@ -6,7 +6,7 @@ import { QpackContext } from './qpack-context';
 
 const STREAM_REF_PREFIX = "::streamref::";
 
-export class QpackCodec {
+export class QpackCodec implements ICodec {
     private context: QpackContext;
 
     constructor(context?: QpackContext) {
@@ -102,13 +102,27 @@ export class QpackCodec {
         }
     }
 
-    decode(data: Uint8Array): any {
-        try {
-            // Pass context to decoder
-            const headers = decodeQpack(data, this.context);
-            return this.inflateHeaders(headers);
-        } catch (error) {
-            throw new RTCSerializationError('Failed to decode QPACK data', error);
+    async decode(data: Uint8Array): Promise<any> {
+        while (true) {
+            try {
+                // Pass context to decoder
+                const headers = decodeQpack(data, this.context);
+                return this.inflateHeaders(headers);
+            } catch (error: any) {
+                // Check for HolBlocking
+                // Error message format: "QPACK Blocked: Required Insert Count X > Local Y"
+                const msg = error.message || "";
+                if (msg.startsWith("QPACK Blocked")) {
+                    const match = msg.match(/Required Insert Count (\d+)/);
+                    if (match) {
+                        const required = parseInt(match[1], 10);
+                        // Wait for context to have this count
+                        await this.context.waitForInsertCount(required);
+                        continue; // Retry
+                    }
+                }
+                throw new RTCSerializationError('Failed to decode QPACK data', error);
+            }
         }
     }
 }

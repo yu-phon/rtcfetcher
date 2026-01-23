@@ -1,10 +1,12 @@
-import { Negotiator } from '../../negotiation/id-negotiator';
+
+import { ITransport, ICodec } from './interfaces';
+import { WebRTCTransport } from '../transport/webrtc-transport';
+import { QpackCodec } from '../qpack/qpack-codec';
+import { QpackContext } from '../qpack/qpack-context';
 
 import { SendStream } from '../../datachannelstream/streams/sendStream';
 import { ReceiveStream } from '../../datachannelstream/streams/receiveStream';
 import { DataChannelController } from '../../datachannelstream/framing/channel-controller';
-import { QpackCodec } from '../qpack/qpack-codec';
-import { QpackContext } from '../qpack/qpack-context';
 import { StreamRef } from '../types/stream-ref';
 import { IncomingRequest } from '../types/message';
 import { RTCResponse } from './rtc-response';
@@ -20,21 +22,12 @@ interface RTCFetchOptions {
     signal?: AbortSignal;
 }
 
-interface PooledChannel {
-    id: number;
-    channel: RTCDataChannel;
-}
-
 export class RTCFetcher {
-    private negotiator: Negotiator;
-    private masterChannel: RTCDataChannel;
+    private transport: ITransport;
     private readonly config: RTCFetcherConfig;
 
-    // QPACK
-    private qpackContext: QpackContext;
-    private qpackCodec: QpackCodec;
-    private qpackEncoderStream: RTCDataChannel;
-    private qpackDecoderStream: RTCDataChannel;
+    // Codec
+    private codec: ICodec;
 
     // Stream exposing incoming requests
     readonly incomingRequests: ReadableStream<IncomingRequest>;
@@ -44,34 +37,52 @@ export class RTCFetcher {
 
     // Cache reserved channels (streams) to avoid collisions
     private reservedChannels: Map<number, RTCDataChannel> = new Map();
-    // ID Pool for 0-RTT negotiation (Stores Physical Channel Objects)
-    private idPool: PooledChannel[] = [];
 
     // Pending Queue for Backpressure
     private pendingChannelQueue: { label: string, channel: RTCDataChannel }[] = [];
 
     constructor(
-        private pc: RTCPeerConnection,
-        config?: RTCFetcherConfig
+        pcOrTransport: RTCPeerConnection | ITransport,
+        config?: RTCFetcherConfig,
+        codec?: ICodec
     ) {
         this.config = config || {};
 
-        // Setup Master Channel (ID 0)
-        this.masterChannel = pc.createDataChannel('rtc-fetcher-master', { negotiated: true, id: 0 });
-        this.negotiator = new Negotiator(this.masterChannel, pc);
+        if ('createDataChannel' in pcOrTransport) {
+            // Legacy Constructor: RTCPeerConnection
+            const pc = pcOrTransport as RTCPeerConnection;
+            this.transport = new WebRTCTransport(pc, { prefetchPoolSize: this.config.prefetchPoolSize });
 
-        // QPACK Control Channels (ID 1 & 2)
-        // Note: We need to agree on IDs. Let's use 1=Encoder, 2=Decoder.
-        // Assuming Master=0. 
-        this.qpackEncoderStream = pc.createDataChannel('qpack-encoder', { negotiated: true, id: 1 });
-        this.qpackDecoderStream = pc.createDataChannel('qpack-decoder', { negotiated: true, id: 2 });
+            // Setup Default Codec (QPACK)
+            // We need access to channels 1 and 2.
+            // We can use the transport we just created.
+            // QPACK requires two unidirectional streams in QUIC.
+            // In WebRTC (P2P Symmetric), we use Bidirectional DataChannels.
+            // ID 1: Encoder Instructions (Bidirectional)
+            //   - Local writes Encoder Instructions here.
+            //   - Remote writes Encoder Instructions here.
+            //   - Local reads Remote's Encoder Instructions from here.
+            // ID 2: Decoder Feedback (Bidirectional) - Reserved for future
 
-        this.qpackContext = new QpackContext();
-        // Encoder Logic writes to encoderStream, reads from decoderStream
-        this.qpackContext.attachChannels(this.qpackEncoderStream, this.qpackDecoderStream);
+            const qpackInstructionStream = this.transport.createChannel('qpack-instructions', 1);
+            // const qpackFeedbackStream = this.transport.createChannel('qpack-feedback', 2);
 
-        this.qpackCodec = new QpackCodec(this.qpackContext);
+            const qpackContext = new QpackContext();
 
+            // We attach the SAME channel for both "Encoder Stream" (sending instructions) 
+            // and "Decoder Stream" (receiving instructions) because in our symmetric setup,
+            // ID 1 carries instructions in both directions.
+            qpackContext.attachChannels(qpackInstructionStream, qpackInstructionStream);
+            this.codec = new QpackCodec(qpackContext);
+
+        } else {
+            // New Constructor: ITransport
+            this.transport = pcOrTransport as ITransport;
+            if (!codec) {
+                throw new Error("Codec must be provided when using custom transport");
+            }
+            this.codec = codec;
+        }
 
         this.incomingRequests = new ReadableStream<IncomingRequest>({
             start: (controller) => {
@@ -84,91 +95,34 @@ export class RTCFetcher {
             highWaterMark: this.config.incomingHighWaterMark ?? 5
         });
 
-        // Setup Negotiator callback for Receiver side
-        this.negotiator.onReserved = (id, channel, label) => this.handleReservedChannel(id, channel, label);
+        // Setup Transport callback
+        this.transport.onIncomingChannel((id, channel, label) => this.handleReservedChannel(id, channel, label));
 
-        this.opened = new Promise<void>((resolve) => {
-            const checkOpen = () => {
-                if (this.masterChannel.readyState === 'open' &&
-                    this.qpackEncoderStream.readyState === 'open' &&
-                    this.qpackDecoderStream.readyState === 'open') {
-
-                    // Start filling the pool once connected
-                    this.refillPool();
-                    resolve();
-                    return true;
-                }
-                return false;
-            };
-
-            if (!checkOpen()) {
-                const handler = () => checkOpen();
-                this.masterChannel.addEventListener('open', handler);
-                this.qpackEncoderStream.addEventListener('open', handler);
-                this.qpackDecoderStream.addEventListener('open', handler);
-            }
-        });
+        this.opened = this.transport.opened;
     }
 
-    private async refillPool() {
-        const targetSize = this.config.prefetchPoolSize ?? 5;
-        // Avoid concurrent refills or over-filling
-        if (this.idPool.length >= targetSize) return;
-
-        console.log(`[RTCFetcher] Refilling ID Pool (Current: ${this.idPool.length}, Target: ${targetSize})`);
-
-        while (this.idPool.length < targetSize) {
-            try {
-                // Determine excluded IDs: Reserved Channels + Current Pool + (Negotiator checks used).
-                // IMPORTANT: Exclude QPACK channels (1, 2)
-                const excluded = new Set<number>([1, 2, ...this.reservedChannels.keys(), ...this.idPool.map(p => p.id)]);
-
-                // Reserve with generic label. Real label is sent via ID-Negotiator's updated sendReady
-                const id = await this.negotiator.reserveId('__pooled__', excluded);
-
-                // Physical ID Lock: Create the channel immediately to prevent external collisions.
-                const channel = this.pc.createDataChannel('__pooled__', { negotiated: true, id });
-                console.log(`[RTCFetcher] Created Pooled Channel ID: ${id}`);
-
-                this.idPool.push({ id, channel });
-            } catch (e) {
-                console.warn('[RTCFetcher] Failed to refill ID pool:', e);
-                break; // Stop refilling on error (e.g. negotiation failure)
-            }
-        }
-    }
-
-    private handleReservedChannel(id: number, existingChannel?: RTCDataChannel, label?: string) {
+    private handleReservedChannel(id: number, channel: RTCDataChannel, label?: string) {
         try {
             // Check label to distinguish Request Channel vs Stream Channel
             if (label && (label === 'stream' || label === 'res-stream')) {
                 // This is a stream channel. Do NOT process as Request.
-                if (existingChannel) {
-                    console.log(`[RTCFetcher] Storing reserved channel for ID ${id} (Label: ${label})`);
-                    this.reservedChannels.set(id, existingChannel);
-                } else {
-                    console.warn(`[RTCFetcher] Stream ID ${id} reserved but no existing channel passed! (Label: ${label})`);
-                }
+                console.log(`[RTCFetcher] Storing reserved channel for ID ${id} (Label: ${label})`);
+                this.reservedChannels.set(id, channel);
                 return;
             }
 
             // Request Channel Logic
-            // 1. Identify Label (Endpoint)
-            // Label comes as 'req::<endpoint>' or just '<endpoint>' if legacy, but we use 'req::' now.
-            // If it was pooled (generic), the READY message updates it.
             let endpoint = label || 'default';
             if (endpoint.startsWith('req::')) {
                 endpoint = endpoint.substring(5);
             }
 
             console.log(`[RTCFetcher] Handle Req Channel ID: ${id}, Label: ${endpoint}`);
-            const channel = existingChannel || this.pc.createDataChannel('rtc-fetcher-req', { negotiated: true, id: id });
 
-            // 2. Queue it (Backpressure)
-            // We do NOT create DataChannelController yet. Not reading means flow control asserts itself on sender.
+            // Queue it (Backpressure)
             this.pendingChannelQueue.push({ label: endpoint, channel });
 
-            // 3. Pump
+            // Pump
             this.pumpIncomingRequests();
 
         } catch (e) {
@@ -196,7 +150,6 @@ export class RTCFetcher {
                 // LAZY READ START
                 console.log(`[RTCFetcher] Opening Request: ${label} (ID: ${channel.id})`);
 
-                // Now we attach controller and start reading
                 const controller = new DataChannelController(channel);
                 const receiveStream = new ReceiveStream(controller);
 
@@ -206,9 +159,6 @@ export class RTCFetcher {
                     controller.close();
                     throw new Error("Failed to decode request body");
                 }
-
-                // Verify internal label matches? (Optional)
-                // const { label: internalLabel, body } = info;
 
                 const { body } = info;
                 const processedBody = await this.processedIncomingBody(body);
@@ -226,7 +176,6 @@ export class RTCFetcher {
                 };
             },
             reject: (_reason) => {
-                // If user rejects, we just close the channel.
                 channel.close();
             }
         };
@@ -236,7 +185,8 @@ export class RTCFetcher {
 
     private async sendResponse(controller: DataChannelController, data: any) {
         const streams: Map<number, ReadableStream> = new Map();
-        const preCreatedChannels = new Map<number, RTCDataChannel>();
+        // Since we are decoupling transport, we don't manage pre-created channels here as much.
+        // We rely on transport.createChannel to give us the right channel.
 
         const excludedIds = new Set<number>();
         if (controller.underlyingChannel.id !== null) {
@@ -244,41 +194,26 @@ export class RTCFetcher {
         }
 
         const processed = await this.traverseAndExtractStreams(data, async (stream) => {
-            let id: number;
-            let pooledChannel: RTCDataChannel | undefined;
-
-            if (this.idPool.length > 0) {
-                const pooled = this.idPool.shift()!;
-                id = pooled.id;
-                pooledChannel = pooled.channel;
-                this.refillPool();
-            } else {
-                id = await this.negotiator.reserveId('res-stream', excludedIds);
-            }
-
+            // Reserve ID via Transport
+            // Note: Transport manages pool.
+            const id = await this.transport.reserveId('res-stream', excludedIds);
             excludedIds.add(id);
-
-            if (pooledChannel) {
-                preCreatedChannels.set(id, pooledChannel);
-            }
 
             streams.set(id, stream);
             return new StreamRef(id);
         });
 
-        const encoded = this.qpackCodec.encode(processed);
-        // Reuse controller
+        const encoded = this.codec.encode(processed);
         const sendStream = new SendStream(controller, this.config.minBufferSize);
 
         // Open stream channels and Signal READY
         const streamReadyPromises: Promise<void>[] = [];
         streams.forEach((stream, id) => {
-            const sChannel = preCreatedChannels.get(id) || this.pc.createDataChannel('res-stream', { negotiated: true, id });
+            const sChannel = this.transport.createChannel('res-stream', id);
             const sStream = new SendStream(sChannel, this.config.minBufferSize);
             stream.pipeTo(sStream.writable).catch(e => console.error(e));
 
-            // Label overrides pooled 'default'
-            streamReadyPromises.push(this.negotiator.sendReady(id, 'res-stream'));
+            streamReadyPromises.push(this.transport.sendReadySignal(id, 'res-stream'));
         });
         await Promise.all(streamReadyPromises);
 
@@ -290,6 +225,8 @@ export class RTCFetcher {
             await sendStream.write(encoded);
         } catch (e) {
             console.error('Error sending response:', e);
+        } finally {
+            controller.close();
         }
     }
 
@@ -326,7 +263,8 @@ export class RTCFetcher {
             return channel;
         }
         console.log(`[RTCFetcher] getOrOpenChannel Miss: Creating new channel for ID ${id}`);
-        return this.pc.createDataChannel('stream', { negotiated: true, id });
+        // Use default label 'stream' for anonymous streams
+        return this.transport.createChannel('stream', id);
     }
 
     private async bufferAndDecode(stream: ReadableStream<Uint8Array>): Promise<{ label: string, body: any } | null> {
@@ -358,7 +296,7 @@ export class RTCFetcher {
             const bodyBytes = await readExact(len);
             if (!bodyBytes) return null;
 
-            const decoded = this.qpackCodec.decode(bodyBytes);
+            const decoded = await this.codec.decode(bodyBytes);
             if (decoded && typeof decoded === 'object') {
                 return decoded;
             }
@@ -377,44 +315,24 @@ export class RTCFetcher {
         }
         await this.opened;
 
-        let reservedId: number;
-        let isPooled = false;
-        let pooledChannel: RTCDataChannel | undefined;
+        // 1. Reserve Request ID (via Transport, manages pool)
+        // Note: Transport needs to know excluded IDs?
+        // Negotiator inside transport knows about its own pool + getStats.
+        // It might NOT know about "ids we are about to use for streams" in this very request.
+        // But here we reserve Req ID first.
+        const reqLabel = 'req::' + label;
+        const reservedId = await this.transport.reserveId(reqLabel, new Set());
 
-        // 1. Find ID (Try Pool First)
-        if (this.idPool.length > 0) {
-            const pooled = this.idPool.shift()!;
-            reservedId = pooled.id;
-            pooledChannel = pooled.channel;
-
-            console.log(`[RTCFetcher] Using Pooled ID: ${reservedId}`);
-            isPooled = true;
-            this.refillPool(); // Trigger refill in background
-        } else {
-            console.log(`[RTCFetcher] Pool Empty. Negotiating directly...`);
-            reservedId = await this.negotiator.findUnusedId();
-            isPooled = false;
-        }
-
-        // 2. Prepare Body (Traverse streams)
+        // 2. Prepare Body
         const streams: Map<number, ReadableStream> = new Map();
         const streamCache: Map<ReadableStream, StreamRef> = new Map();
-        const preCreatedStreamChannels: Map<number, RTCDataChannel> = new Map();
 
-        const excludedIds = new Set<number>([reservedId, ...this.idPool.map(p => p.id)]);
+        const excludedIds = new Set<number>([reservedId]);
 
         const processedBody = await this.traverseAndExtractStreams(body, async (stream) => {
             if (streamCache.has(stream)) return streamCache.get(stream)!;
 
-            let streamId: number;
-            if (this.idPool.length > 0) {
-                const p = this.idPool.shift()!;
-                streamId = p.id;
-                preCreatedStreamChannels.set(streamId, p.channel);
-                this.refillPool();
-            } else {
-                streamId = await this.negotiator.reserveId('stream', excludedIds);
-            }
+            const streamId = await this.transport.reserveId('stream', excludedIds);
 
             excludedIds.add(streamId);
             streams.set(streamId, stream);
@@ -423,14 +341,9 @@ export class RTCFetcher {
             return ref;
         });
 
-        // 5. Handshake (Only if NOT pulled from pool)
-        if (!isPooled) {
-            await this.negotiator.performHandshake(reservedId, 'req::' + label);
-        }
-
-        // 6. Create Channel & Controller (Sender Side)
+        // 3. Create Channel
         console.log("Reserved ID (Local):", reservedId);
-        const mainChannel = pooledChannel || this.pc.createDataChannel(label, { negotiated: true, id: reservedId });
+        const mainChannel = this.transport.createChannel(reqLabel, reservedId);
         const controller = new DataChannelController(mainChannel);
 
         // Abort Logic
@@ -441,7 +354,6 @@ export class RTCFetcher {
         };
         if (signal) {
             signal.addEventListener('abort', abortHandler);
-            // Cleanup listener on close? 
             controller.underlyingChannel.addEventListener('close', () => {
                 signal.removeEventListener('abort', abortHandler);
             });
@@ -450,10 +362,10 @@ export class RTCFetcher {
         const responseReader = new ReceiveStream(controller);
         const sendStream = new SendStream(controller, this.config.minBufferSize);
 
-        // 6. Signal Channel Ready
-        await this.negotiator.sendReady(reservedId, 'req::' + label);
+        // 4. Signal Ready
+        await this.transport.sendReadySignal(reservedId, reqLabel);
 
-        const encoded = this.qpackCodec.encode({ label, body: processedBody });
+        const encoded = this.codec.encode({ label, body: processedBody });
 
         if (controller.readyState !== 'open') {
             await new Promise<void>((resolve, reject) => {
@@ -470,10 +382,10 @@ export class RTCFetcher {
 
         const streamReadyPromises: Promise<void>[] = [];
         streams.forEach((stream, id) => {
-            const channel = preCreatedStreamChannels.get(id) || this.pc.createDataChannel('stream', { negotiated: true, id });
+            const channel = this.transport.createChannel('stream', id);
             const sStream = new SendStream(channel, this.config.minBufferSize);
             stream.pipeTo(sStream.writable).catch(e => console.error(e));
-            streamReadyPromises.push(this.negotiator.sendReady(id, 'stream'));
+            streamReadyPromises.push(this.transport.sendReadySignal(id, 'stream'));
         });
         await Promise.all(streamReadyPromises);
 
@@ -499,7 +411,6 @@ export class RTCFetcher {
                     const take = Math.min(needed, value.byteLength);
                     buf.set(value.subarray(0, take), offset);
                     offset += take;
-                    if (value.byteLength > take) console.warn('Excess data in response channel');
                 }
                 return buf;
             };
@@ -510,7 +421,7 @@ export class RTCFetcher {
                     const len = new DataView(lenBuf.buffer).getUint32(0, true);
                     const bodyBuf = await readExact(len);
 
-                    const resData = this.qpackCodec.decode(bodyBuf);
+                    const resData = await this.codec.decode(bodyBuf);
                     resolve(new RTCResponse(resData, (ref) => {
                         return new ReadableStream({
                             start: (c) => {
@@ -523,11 +434,13 @@ export class RTCFetcher {
                                 }));
                             }
                         });
-                    }));
+                    }, { encodedSize: len }));
                 } catch (e) {
                     reject(e);
                 } finally {
                     reader.releaseLock();
+                    // Close the request channel as we have received the full response
+                    controller.close();
                 }
             })();
         });

@@ -1,15 +1,35 @@
 
 import { QpackCodec } from '../qpack/qpack-codec';
+import { QpackContext } from '../qpack/qpack-context';
 import { StreamRef } from '../types/stream-ref';
+
+class MockChannel {
+    onmessage: ((event: any) => void) | null = null;
+    peer: MockChannel | null = null;
+    readyState = 'open';
+    send(data: any) {
+        if (this.peer && this.peer.onmessage) {
+            this.peer.onmessage({ data });
+        }
+    }
+}
 
 describe('QpackCodec', () => {
     let codec: QpackCodec;
+    let context: QpackContext;
 
     beforeEach(() => {
-        codec = new QpackCodec();
+        const encoderStream = new MockChannel();
+        const decoderStream = new MockChannel();
+        encoderStream.peer = decoderStream;
+        decoderStream.peer = encoderStream;
+
+        context = new QpackContext();
+        context.attachChannels(encoderStream as any, decoderStream as any);
+        codec = new QpackCodec(context);
     });
 
-    it('should encode and decode flat primitive objects', () => {
+    it('should encode and decode flat primitive objects', async () => {
         const obj = {
             label: 'test-endpoint',
             status: 200,
@@ -21,11 +41,11 @@ describe('QpackCodec', () => {
         expect(encoded).toBeInstanceOf(Uint8Array);
         expect(encoded.length).toBeGreaterThan(0);
 
-        const decoded = codec.decode(encoded);
+        const decoded = await codec.decode(encoded);
         expect(decoded).toEqual(obj);
     });
 
-    it('should encode and decode nested objects', () => {
+    it('should encode and decode nested objects', async () => {
         const obj = {
             meta: {
                 version: 1,
@@ -38,19 +58,19 @@ describe('QpackCodec', () => {
         };
 
         const encoded = codec.encode(obj);
-        const decoded = codec.decode(encoded);
+        const decoded = await codec.decode(encoded);
 
         expect(decoded).toEqual(obj);
     });
 
-    it('should handle StreamRef', () => {
+    it('should handle StreamRef', async () => {
         const obj = {
             stream: new StreamRef(123),
             other: 'data'
         };
 
         const encoded = codec.encode(obj);
-        const decoded = codec.decode(encoded);
+        const decoded = await codec.decode(encoded);
 
         // Verify StreamRef is restored (instance check or structure check)
         expect(decoded.stream).toBeInstanceOf(StreamRef);
@@ -58,7 +78,7 @@ describe('QpackCodec', () => {
         expect(decoded.other).toBe('data');
     });
 
-    it('should handle deep nesting with arrays', () => {
+    it('should handle deep nesting with arrays', async () => {
         const obj = {
             data: [
                 { id: 1, val: 'one' },
@@ -67,7 +87,7 @@ describe('QpackCodec', () => {
         };
 
         const encoded = codec.encode(obj);
-        const decoded = codec.decode(encoded);
+        const decoded = await codec.decode(encoded);
 
         expect(decoded).toEqual(obj);
     });

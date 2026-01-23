@@ -7,6 +7,7 @@ const sendFlatBtn = document.getElementById('sendFlatBtn') as HTMLButtonElement;
 const sendDeepBtn = document.getElementById('sendDeepBtn') as HTMLButtonElement;
 const sendArrayBtn = document.getElementById('sendArrayBtn') as HTMLButtonElement;
 const sendMixedBtn = document.getElementById('sendMixedBtn') as HTMLButtonElement;
+const sendRepeatedBtn = document.getElementById('sendRepeatedBtn') as HTMLButtonElement;
 
 const log1 = document.getElementById('log1') as HTMLDivElement;
 const log2 = document.getElementById('log2') as HTMLDivElement;
@@ -56,6 +57,7 @@ connectBtn.addEventListener('click', async () => {
     sendDeepBtn.disabled = false;
     sendArrayBtn.disabled = false;
     sendMixedBtn.disabled = false;
+    sendRepeatedBtn.disabled = false;
 });
 
 // Receiver Logic
@@ -155,4 +157,43 @@ sendMixedBtn.addEventListener('click', async () => {
     } else {
         log(1, 'Failed: payloadStream is not a ReadableStream', receivedStream);
     }
+});
+
+sendRepeatedBtn.addEventListener('click', async () => {
+    log(1, '--- Sending Repeated Object (Dynamic Table Test) ---');
+    const data = {
+        "x-custom-header": "This is a very long value that should be compressed by the dynamic table on the second send.",
+        "x-id": 1,
+        "x-timestamp": Date.now()
+    };
+
+    log(1, '1. Sending First Request (Should Insert to Dynamic Table)...');
+    const res1 = await fetcher1.fetch('qpack-repeat', data);
+    const json1 = await res1.json();
+    log(1, 'Response 1:', json1);
+
+    // @ts-ignore
+    const enc1 = res1.qpackStats?.encodedSize || 0;
+    const raw1 = JSON.stringify(data).length; // Approx
+    log(1, `Req 1 Stats: Encoded ${enc1} bytes vs Raw JSON ~${raw1} bytes. Ratio: ${(enc1 / raw1).toFixed(2)}`);
+
+    log(1, '2. Sending Second Request (Should Reference Dynamic Table)...');
+    // We update timestamp to differentiate, but keep the long string same
+    const data2 = { ...data, "x-id": 2, "x-timestamp": Date.now() };
+    const res2 = await fetcher1.fetch('qpack-repeat', data2);
+    const json2 = await res2.json();
+    log(1, 'Response 2:', json2);
+
+    // @ts-ignore
+    const enc2 = res2.qpackStats?.encodedSize || 0;
+    const raw2 = JSON.stringify(data2).length;
+    log(1, `Req 2 Stats: Encoded ${enc2} bytes vs Raw JSON ~${raw2} bytes. Ratio: ${(enc2 / raw2).toFixed(2)}`);
+
+    if (enc2 < enc1) {
+        log(1, 'SUCCESS: Request 2 is smaller than Request 1, Dynamic Table used!');
+    } else {
+        log(1, 'WARNING: No compression gain. Dynamic Table might not be syncing.');
+    }
+
+    log(1, 'If both requests succeeded, Dynamic Table sync is working!');
 });

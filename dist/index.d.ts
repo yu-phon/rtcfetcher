@@ -21,12 +21,16 @@ declare class StreamRef {
 declare class RTCResponse {
     private _body;
     private _streamReplacer;
+    private _streamCache;
     constructor(body: any, streamReplacer: (ref: StreamRef) => ReadableStream<Uint8Array> | null);
+    private _wrapValue;
+    private _getOrHydrateStream;
     get ok(): boolean;
     json(): Promise<any>;
     text(): Promise<string>;
     blob(): Promise<Blob>;
-    private processBody;
+    private processBodyAndBufferStreams;
+    private _consumeStream;
 }
 
 interface RTCFetcherConfig {
@@ -42,6 +46,10 @@ declare class RTCFetcher {
     private negotiator;
     private masterChannel;
     private readonly config;
+    private qpackContext;
+    private qpackCodec;
+    private qpackEncoderStream;
+    private qpackDecoderStream;
     readonly incomingRequests: ReadableStream<IncomingRequest>;
     private incomingRequestsController?;
     readonly opened: Promise<void>;
