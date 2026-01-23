@@ -77,8 +77,10 @@ function uint8ArrayToStream(data: Uint8Array): ReadableStream<Uint8Array> {
 }
 
 function stringToStream(str: string): ReadableStream<Uint8Array> {
+    if (typeof Blob !== 'undefined') {
+        return new Blob([str]).stream();
+    }
     const encoder = new TextEncoder();
     const data = encoder.encode(str);
-    // If encoding makes it huge, we already have it in memory anyway.
     return uint8ArrayToStream(data);
 }

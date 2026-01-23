@@ -1,21 +1,18 @@
 import { DataChannelController } from '../framing/channel-controller';
+import { DEFAULT_INITIAL_WINDOW } from '../framing/constants';
 
 export class SendStream {
     private readonly stream: WritableStream<Uint8Array>;
     private writer?: WritableStreamDefaultWriter<Uint8Array>;
     private controller: DataChannelController;
-    private sendWindow: number = 0; // Initial window is 0, waiting for grant? Or start with some?
-    // Plan said: "Initial window: determined by config (e.g., 64KB? or 0 and wait for initial grant?)."
-    // To match common behavior, maybe start with 0 and wait for receiver to say "I'm ready"?
-    // Or assume receiver starts with some buffer?
-    // Let's assume 0 and wait for initial credit from Receiver (who sends it on start).
+    private sendWindow: number = 0; // Starts at 0, waits for initial credit from Receiver.
 
     private creditResolvers: (() => void)[] = [];
 
 
     constructor(
         channelOrController: RTCDataChannel | DataChannelController,
-        private readonly highWaterMark: number = 64 * 1024 // 64KB
+        private readonly highWaterMark: number = DEFAULT_INITIAL_WINDOW
     ) {
         // Use duck typing to avoid instanceof issues with dual module loading
         if ('sendCredit' in channelOrController && typeof (channelOrController as any).sendCredit === 'function') {
@@ -25,7 +22,7 @@ export class SendStream {
         }
 
         this.controller.onCredit = (amount) => {
-            console.log(`[SendStream] Received credit: ${amount}. Current Window: ${this.sendWindow} -> ${this.sendWindow + amount}`);
+            // console.debug(`[SendStream] Received credit: ${amount}. Window: ${this.sendWindow} -> ${this.sendWindow + amount}`);
             this.sendWindow += amount;
             this.processPendingWrites();
         };
@@ -34,11 +31,10 @@ export class SendStream {
             write: this.writeChunk.bind(this),
             close: async () => {
                 // Wait for bufferedAmount to be 0
-                // And give a small grace period for in-flight ACKs or protocol shutdown
                 if (this.controller.bufferedAmount > 0) {
                     await this.waitForBufferedAmountLow();
                 }
-                await new Promise(r => setTimeout(r, 100)); // Grace period
+                await new Promise(r => setTimeout(r, 50)); // Short grace period
                 this.controller.close();
             },
             abort: () => {
@@ -60,12 +56,8 @@ export class SendStream {
 
     async close(): Promise<void> {
         if (!this.writer) {
-            // If not writing manually, acquire writer temporarily to close
             if (this.stream.locked) {
-                // If locked by someone else (e.g. pipeTo), we can't close via writer.
-                // But underlying channel close is handled by abort/close defined in WritableStream sink.
-                // If we want to force close the stream?
-                // Usually we just return.
+                // Stream is locked by another writer (e.g. pipeTo), we cannot close via writer.
                 return;
             }
             this.writer = this.stream.getWriter();
@@ -83,9 +75,10 @@ export class SendStream {
                     cleanup();
                     resolve();
                 };
-                const onError = (_e: Event) => {
+                const onError = (e: Event) => {
                     cleanup();
-                    reject(new Error('DataChannel error during wait for open'));
+                    const err = (e as any).error || new Error('DataChannel error during wait for open');
+                    reject(err);
                 };
                 const onClose = () => {
                     cleanup();
@@ -106,14 +99,11 @@ export class SendStream {
         while (offset < chunk.byteLength) {
             const remaining = chunk.byteLength - offset;
 
-            // Wait for credit if we have NONE
             while (this.sendWindow === 0) {
-                console.log(`[SendStream] Waiting for credit. Needed > 0, Current: ${this.sendWindow}`);
+                // console.debug(`[SendStream] Waiting for credit.`);
                 await this.waitForCredit();
             }
 
-            // Determine size to send
-            // We limit by BOTH the credit window AND the MTU size
             const toSendSize = Math.min(remaining, this.sendWindow, this.maxChunkSize);
             const slice = chunk.subarray(offset, offset + toSendSize);
 
@@ -126,7 +116,6 @@ export class SendStream {
                 this.controller.sendData(slice);
                 this.sendWindow -= toSendSize;
                 offset += toSendSize;
-                console.log(`[SendStream] Sent fragment ${toSendSize} bytes. Offset: ${offset}/${chunk.byteLength}`);
             } catch (error) {
                 console.error('SendStream failed to send:', error);
                 throw error;
@@ -142,9 +131,6 @@ export class SendStream {
 
     private processPendingWrites() {
         while (this.creditResolvers.length > 0 && this.sendWindow > 0) {
-            // We wake up ALL waiters? 
-            // Better: wake them up one by one or all, they will check condition again.
-            // Since they are in a loop (while), waking them ensures they re-check.
             const resolver = this.creditResolvers.shift();
             if (resolver) resolver();
         }

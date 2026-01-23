@@ -1,10 +1,11 @@
 import { DataChannelController } from '../framing/channel-controller';
+import { DEFAULT_INITIAL_WINDOW } from '../framing/constants';
 
 export class ReceiveStream {
     private readonly stream: ReadableStream<Uint8Array>;
     private controller: DataChannelController;
     private unacknowledgedBytes = 0;
-    private readonly initialCredit = 64 * 1024; // 64KB
+    private readonly initialCredit = DEFAULT_INITIAL_WINDOW;
 
 
     constructor(
@@ -17,15 +18,14 @@ export class ReceiveStream {
             this.controller = new DataChannelController(channelOrController as RTCDataChannel);
         }
 
-        this.stream = new ReadableStream({
+        this.stream = new ReadableStream<Uint8Array>({
             start: (controller) => {
                 const init = () => {
                     // Initial credit grant
                     this.controller.sendCredit(this.initialCredit);
-                    console.log(`[ReceiveStream] Sent initial credit: ${this.initialCredit}`);
+                    // console.debug(`[ReceiveStream] Sent initial credit: ${this.initialCredit}`);
 
                     this.controller.onData = (data) => {
-                        // console.log("channel message") // Verbose
                         controller.enqueue(data);
                         this.unacknowledgedBytes += data.byteLength;
 
@@ -47,7 +47,7 @@ export class ReceiveStream {
                 }
 
                 this.controller.underlyingChannel.onclose = () => {
-                    console.log("channel close");
+                    // console.debug("channel close");
                     try {
                         controller.close();
                     } catch (e) {
@@ -58,7 +58,7 @@ export class ReceiveStream {
                     const err = event instanceof ErrorEvent ? event.error : event;
                     // "OperationError" often happens during close race conditions in WebRTC.
                     if (err && err.name === 'OperationError') {
-                        console.warn("[ReceiveStream] Ignoring OperationError on DataChannel (likely close race).", err);
+                        // console.warn("[ReceiveStream] Ignoring OperationError on DataChannel (likely close race).", err);
                         return;
                     }
                     try {
@@ -67,10 +67,8 @@ export class ReceiveStream {
                         // Controller might be already closed
                     }
                 };
-                // Note: we might attach onopen above, and also here for logging.
-                // Duplicate listeners are safe if references differ, but here we used named function for init.
-                // For logging:
-                this.controller.underlyingChannel.addEventListener('open', () => console.log("channel open"));
+
+                // this.controller.underlyingChannel.addEventListener('open', () => console.log("channel open"));
             },
             pull: (_controller) => {
                 // Stream has capacity, flush any pending credits
@@ -79,14 +77,12 @@ export class ReceiveStream {
             cancel: () => {
                 this.controller.close();
             }
-        }, {
-            highWaterMark: this.initialCredit // Match HWM to our credit window logic
-        });
+        }, new ByteLengthQueuingStrategy({ highWaterMark: this.initialCredit }));
     }
 
     private flushCredits() {
         if (this.unacknowledgedBytes > 0) {
-            console.log(`[ReceiveStream] Flushing credits: ${this.unacknowledgedBytes}`);
+            // console.debug(`[ReceiveStream] Flushing credits: ${this.unacknowledgedBytes}`);
             this.controller.sendCredit(this.unacknowledgedBytes);
             this.unacknowledgedBytes = 0;
         }

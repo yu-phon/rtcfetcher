@@ -37,12 +37,19 @@ var RTCSerializationError = class extends RTCFetcherError {
   }
 };
 
+// src/negotiation/constants.ts
+var NEGOTIATION_TIMEOUT_MS = 3e3;
+var READY_WAIT_TIMEOUT_MS = 1e4;
+var MAX_NEGOTIATION_ATTEMPTS = 5;
+var SAFE_MAX_CHANNEL_ID = 255;
+var SIGNALING_CHANNEL_ID = 0;
+var POOLED_CHANNEL_LABEL = "__pooled__";
+
 // src/negotiation/id-negotiator.ts
-var _Negotiator = class _Negotiator {
+var Negotiator = class {
   constructor(signalingChannel, pc) {
     this.signalingChannel = signalingChannel;
     this.pc = pc;
-    // SCTP limit 65535, 255 reserved
     this.pendingReservations = /* @__PURE__ */ new Map();
     // Reservations that are ACKed but waiting for READY from peer
     this.waitingForReady = /* @__PURE__ */ new Map();
@@ -57,8 +64,7 @@ var _Negotiator = class _Negotiator {
    */
   async reserveId(label, excludedIds = /* @__PURE__ */ new Set()) {
     let attempts = 0;
-    const maxAttempts = 5;
-    while (attempts < maxAttempts) {
+    while (attempts < MAX_NEGOTIATION_ATTEMPTS) {
       attempts++;
       const candidateId = await this.findUnusedId(excludedIds);
       try {
@@ -76,7 +82,7 @@ var _Negotiator = class _Negotiator {
       const timeout = setTimeout(() => {
         this.pendingReservations.delete(id);
         reject(new Error("Reservation timeout"));
-      }, 3e3);
+      }, NEGOTIATION_TIMEOUT_MS);
       this.pendingReservations.set(id, {
         resolve: () => {
           clearTimeout(timeout);
@@ -109,11 +115,21 @@ var _Negotiator = class _Negotiator {
         isUsed = true;
       }
     }
-    if (isUsed) {
+    if (isUsed || !probeChannel) {
       console.warn(`[Negotiator] Rejecting ID ${id} (Used or Probe Failed)`);
       this.send({ type: "NACK", id });
     } else {
-      this.waitingForReady.set(id, { channel: probeChannel, label: message.label });
+      const timeoutTimer = setTimeout(() => {
+        const pending = this.waitingForReady.get(id);
+        if (pending) {
+          console.warn(`[Negotiator] Timeout waiting for READY on ID ${id}. Cleaning up.`);
+          if (pending.channel && pending.channel.readyState !== "closed") {
+            pending.channel.close();
+          }
+          this.waitingForReady.delete(id);
+        }
+      }, READY_WAIT_TIMEOUT_MS);
+      this.waitingForReady.set(id, { channel: probeChannel, label: message.label, timer: timeoutTimer });
       this.send({ type: "ACK", id });
     }
   }
@@ -121,10 +137,13 @@ var _Negotiator = class _Negotiator {
     const id = message.id;
     const waiting = this.waitingForReady.get(id);
     if (waiting) {
+      if (waiting.timer) clearTimeout(waiting.timer);
       this.waitingForReady.delete(id);
-      if (this.onReserved) {
+      if (this.onReserved && waiting.channel) {
         const finalLabel = message.label || waiting.label;
         this.onReserved(id, waiting.channel, finalLabel);
+      } else if (!waiting.channel) {
+        console.error(`[Negotiator] Unexpected: Ready received but no channel found for ID ${id}`);
       }
     } else {
     }
@@ -180,8 +199,8 @@ var _Negotiator = class _Negotiator {
     const sctp = this.pc.sctp;
     const max = sctp?.maxChannels ?? sctp?.maxDataChannels;
     let limit = max && max > 0 ? max : 256;
-    console.log(`[Negotiator] findUnusedId. Detected max: ${max}, Using limit: ${255}`);
-    if (limit > 255) limit = 255;
+    console.log(`[Negotiator] findUnusedId. Detected max: ${max}, Using limit: ${SAFE_MAX_CHANNEL_ID}`);
+    if (limit > SAFE_MAX_CHANNEL_ID) limit = SAFE_MAX_CHANNEL_ID;
     const start = Math.floor(Math.random() * (limit - 1)) + 1;
     let candidate = -1;
     for (let offset = 0; offset < limit - 1; offset++) {
@@ -190,7 +209,7 @@ var _Negotiator = class _Negotiator {
       const rangeSize = limit - 1;
       const zeroBased = (start - 1 + offset) % rangeSize;
       i = zeroBased + 1;
-      if (i === _Negotiator.SIGNALING_CHANNEL_ID) continue;
+      if (i === SIGNALING_CHANNEL_ID) continue;
       if (!usedIds.has(i) && !excludedIds?.has(i)) {
         candidate = i;
         break;
@@ -217,312 +236,100 @@ var _Negotiator = class _Negotiator {
     return usedIds;
   }
 };
-_Negotiator.SIGNALING_CHANNEL_ID = 0;
-_Negotiator.MAX_CHANNEL_ID = 65534;
-var Negotiator = _Negotiator;
 
-// src/datachannelstream/framing/channel-controller.ts
-var MSG_TYPE_DATA = 1;
-var MSG_TYPE_CREDIT = 2;
-var DataChannelController = class {
-  constructor(channel) {
-    this.channel = channel;
-    this.pendingCredit = 0;
-    this.instanceId = Math.random().toString(36).substring(7);
-    console.log(`[DataChannelController:${this.channel.id}:${this.instanceId}] Created. Type: ${channel.constructor?.name}`);
-    this.channel.binaryType = "arraybuffer";
-    this.channel.onmessage = this.handleMessage.bind(this);
+// src/negotiation/id-pool-manager.ts
+var IdPoolManager = class {
+  constructor(negotiator, pc, config = {}) {
+    this.negotiator = negotiator;
+    this.pc = pc;
+    this.config = config;
+    this.idPool = [];
+    this.pooledChannelMap = /* @__PURE__ */ new Map();
   }
-  set onCredit(handler) {
-    console.log(`[DataChannelController:${this.channel.id}:${this.instanceId}] Setting onCredit handler. Pending: ${this.pendingCredit}`);
-    this._onCredit = handler;
-    if (handler && this.pendingCredit > 0) {
-      console.log(`[DataChannelController:${this.channel.id}:${this.instanceId}] Flushing pending credit: ${this.pendingCredit}`);
-      handler(this.pendingCredit);
-      this.pendingCredit = 0;
+  async reserveId(label, excludedIds) {
+    if (this.idPool.length > 0) {
+      const pooled = this.idPool.shift();
+      console.log(`[IdPoolManager] Using Pooled ID: ${pooled.id}`);
+      this.refillPool();
+      return pooled.id;
     }
+    console.log(`[IdPoolManager] Pool Empty. Negotiating directly...`);
+    const allExcluded = new Set(excludedIds);
+    this.idPool.forEach((p) => allExcluded.add(p.id));
+    return await this.negotiator.reserveId(label, allExcluded);
   }
-  get onCredit() {
-    return this._onCredit;
-  }
-  get readyState() {
-    return this.channel.readyState;
-  }
-  get bufferedAmount() {
-    return this.channel.bufferedAmount;
-  }
-  get underlyingChannel() {
-    return this.channel;
-  }
-  sendData(data) {
-    if (this.channel.readyState !== "open") {
-      console.warn(`[DataChannelController:${this.channel.id}:${this.instanceId}] Attempted sendData on non-open channel (${this.channel.readyState})`);
-      return;
+  /**
+   * Retrieves a channel for the given ID. 
+   * If the ID was from the pool, returns the pre-created channel.
+   * Otherwise, creates a new one.
+   */
+  getOrCreateChannel(label, id) {
+    if (this.pooledChannelMap.has(id)) {
+      const channel = this.pooledChannelMap.get(id);
+      this.pooledChannelMap.delete(id);
+      return channel;
     }
-    const frame = new Uint8Array(1 + data.byteLength);
-    frame[0] = MSG_TYPE_DATA;
-    frame.set(data, 1);
-    try {
-      this.channel.send(frame);
-    } catch (e) {
-      console.error(`[DataChannelController:${this.channel.id}:${this.instanceId}] sendData failed`, e);
-      throw e;
-    }
+    return this.pc.createDataChannel(label, { negotiated: true, id });
   }
-  sendCredit(amount) {
-    if (this.channel.readyState !== "open") {
-      console.warn(`[DataChannelController:${this.channel.id}:${this.instanceId}] Attempted sendCredit on non-open channel (${this.channel.readyState})`);
-      return;
-    }
-    const frame = new Uint8Array(1 + 4);
-    frame[0] = MSG_TYPE_CREDIT;
-    const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
-    view.setUint32(1, amount, true);
-    try {
-      this.channel.send(frame);
-    } catch (e) {
-      console.error(`[DataChannelController:${this.channel.id}:${this.instanceId}] sendCredit failed`, e);
-    }
-  }
-  close() {
-    this.channel.close();
-  }
-  handleMessage(event) {
-    const data = event.data;
-    if (data instanceof ArrayBuffer) {
-      this.processBuffer(new Uint8Array(data));
-    } else if (data instanceof Uint8Array) {
-      this.processBuffer(data);
-    } else {
-      console.warn(`[DataChannelController:${this.channel.id}:${this.instanceId}] Received non-binary data, ignoring.`);
-    }
-  }
-  processBuffer(buffer) {
-    if (buffer.byteLength < 1) return;
-    const type = buffer[0];
-    if (type === MSG_TYPE_DATA) {
-      if (this.onData) {
-        this.onData(buffer.subarray(1));
-      } else {
-        console.warn(`[DataChannelController:${this.channel.id}:${this.instanceId}] No onData handler!`);
-      }
-    } else if (type === MSG_TYPE_CREDIT) {
-      const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-      const credit = view.getUint32(1, true);
-      console.log(`[DataChannelController:${this.channel.id}:${this.instanceId}] CREDIT frame. Amount: ${credit}`);
-      if (buffer.byteLength >= 5) {
-        if (this._onCredit) {
-          this._onCredit(credit);
-        } else {
-          console.log(`[DataChannelController:${this.channel.id}:${this.instanceId}] No onCredit handler! Buffering: ${credit}`);
-          this.pendingCredit += credit;
-        }
-      }
-    } else {
-      console.warn(`[DataChannelController:${this.channel.id}:${this.instanceId}] Unknown message type:`, type);
-    }
-  }
-};
-
-// src/datachannelstream/streams/sendStream.ts
-var SendStream = class {
-  constructor(channelOrController, highWaterMark = 64 * 1024) {
-    this.highWaterMark = highWaterMark;
-    this.sendWindow = 0;
-    // Initial window is 0, waiting for grant? Or start with some?
-    // Plan said: "Initial window: determined by config (e.g., 64KB? or 0 and wait for initial grant?)."
-    // To match common behavior, maybe start with 0 and wait for receiver to say "I'm ready"?
-    // Or assume receiver starts with some buffer?
-    // Let's assume 0 and wait for initial credit from Receiver (who sends it on start).
-    this.creditResolvers = [];
-    this.maxChunkSize = 16 * 1024;
-    if ("sendCredit" in channelOrController && typeof channelOrController.sendCredit === "function") {
-      this.controller = channelOrController;
-    } else {
-      this.controller = new DataChannelController(channelOrController);
-    }
-    this.controller.onCredit = (amount) => {
-      console.log(`[SendStream] Received credit: ${amount}. Current Window: ${this.sendWindow} -> ${this.sendWindow + amount}`);
-      this.sendWindow += amount;
-      this.processPendingWrites();
-    };
-    this.stream = new WritableStream({
-      write: this.writeChunk.bind(this),
-      close: async () => {
-        if (this.controller.bufferedAmount > 0) {
-          await this.waitForBufferedAmountLow();
-        }
-        await new Promise((r) => setTimeout(r, 100));
-        this.controller.close();
-      },
-      abort: () => {
-        this.controller.close();
-      }
-    });
-  }
-  get writable() {
-    return this.stream;
-  }
-  async write(data) {
-    if (!this.writer) {
-      this.writer = this.stream.getWriter();
-    }
-    return this.writer.write(data);
-  }
-  async close() {
-    if (!this.writer) {
-      if (this.stream.locked) {
-        return;
-      }
-      this.writer = this.stream.getWriter();
-    }
-    return this.writer.close();
-  }
-  // 16KB MTU limit
-  async writeChunk(chunk) {
-    if (this.controller.readyState !== "open") {
-      await new Promise((resolve, reject) => {
-        if (this.controller.readyState === "open") return resolve();
-        const onOpen = () => {
-          cleanup();
-          resolve();
-        };
-        const onError = (_e) => {
-          cleanup();
-          reject(new Error("DataChannel error during wait for open"));
-        };
-        const onClose = () => {
-          cleanup();
-          reject(new Error("DataChannel closed before open"));
-        };
-        const cleanup = () => {
-          this.controller.underlyingChannel.removeEventListener("open", onOpen);
-          this.controller.underlyingChannel.removeEventListener("error", onError);
-          this.controller.underlyingChannel.removeEventListener("close", onClose);
-        };
-        this.controller.underlyingChannel.addEventListener("open", onOpen);
-        this.controller.underlyingChannel.addEventListener("error", onError);
-        this.controller.underlyingChannel.addEventListener("close", onClose);
-      });
-    }
-    let offset = 0;
-    while (offset < chunk.byteLength) {
-      const remaining = chunk.byteLength - offset;
-      while (this.sendWindow === 0) {
-        console.log(`[SendStream] Waiting for credit. Needed > 0, Current: ${this.sendWindow}`);
-        await this.waitForCredit();
-      }
-      const toSendSize = Math.min(remaining, this.sendWindow, this.maxChunkSize);
-      const slice = chunk.subarray(offset, offset + toSendSize);
-      if (this.controller.bufferedAmount > this.highWaterMark) {
-        await this.waitForBufferedAmountLow();
-      }
+  async refillPool() {
+    const targetSize = this.config.prefetchPoolSize ?? 5;
+    if (this.idPool.length >= targetSize) return;
+    console.log(`[IdPoolManager] Refilling ID Pool (Current: ${this.idPool.length}, Target: ${targetSize})`);
+    while (this.idPool.length < targetSize) {
       try {
-        this.controller.sendData(slice);
-        this.sendWindow -= toSendSize;
-        offset += toSendSize;
-        console.log(`[SendStream] Sent fragment ${toSendSize} bytes. Offset: ${offset}/${chunk.byteLength}`);
-      } catch (error) {
-        console.error("SendStream failed to send:", error);
-        throw error;
+        const excluded = /* @__PURE__ */ new Set([1, 2, ...this.idPool.map((p) => p.id)]);
+        const id = await this.negotiator.reserveId(POOLED_CHANNEL_LABEL, excluded);
+        const channel = this.pc.createDataChannel(POOLED_CHANNEL_LABEL, { negotiated: true, id });
+        console.log(`[IdPoolManager] Created Pooled Channel ID: ${id}`);
+        const pooled = { id, channel };
+        this.idPool.push(pooled);
+        this.pooledChannelMap.set(id, channel);
+      } catch (e) {
+        console.warn("[IdPoolManager] Failed to refill ID pool:", e);
+        break;
       }
     }
-  }
-  waitForCredit() {
-    return new Promise((resolve) => {
-      this.creditResolvers.push(resolve);
-    });
-  }
-  processPendingWrites() {
-    while (this.creditResolvers.length > 0 && this.sendWindow > 0) {
-      const resolver = this.creditResolvers.shift();
-      if (resolver) resolver();
-    }
-  }
-  waitForBufferedAmountLow() {
-    return new Promise((resolve) => {
-      const handler = () => {
-        this.controller.underlyingChannel.removeEventListener("bufferedamountlow", handler);
-        resolve();
-      };
-      this.controller.underlyingChannel.addEventListener("bufferedamountlow", handler);
-    });
   }
 };
 
-// src/datachannelstream/streams/receiveStream.ts
-var ReceiveStream = class {
-  // 64KB
-  constructor(channelOrController) {
-    this.unacknowledgedBytes = 0;
-    this.initialCredit = 64 * 1024;
-    if ("sendCredit" in channelOrController && typeof channelOrController.sendCredit === "function") {
-      this.controller = channelOrController;
-    } else {
-      this.controller = new DataChannelController(channelOrController);
-    }
-    this.stream = new ReadableStream({
-      start: (controller) => {
-        const init = () => {
-          this.controller.sendCredit(this.initialCredit);
-          console.log(`[ReceiveStream] Sent initial credit: ${this.initialCredit}`);
-          this.controller.onData = (data) => {
-            controller.enqueue(data);
-            this.unacknowledgedBytes += data.byteLength;
-            if (controller.desiredSize !== null && controller.desiredSize > 0) {
-              this.flushCredits();
-            }
-          };
-        };
-        if (this.controller.readyState === "open") {
-          init();
-        } else {
-          const onOpen = () => {
-            this.controller.underlyingChannel.removeEventListener("open", onOpen);
-            init();
-          };
-          this.controller.underlyingChannel.addEventListener("open", onOpen);
-        }
-        this.controller.underlyingChannel.onclose = () => {
-          console.log("channel close");
-          try {
-            controller.close();
-          } catch (e) {
-          }
-        };
-        this.controller.underlyingChannel.onerror = (event) => {
-          const err = event instanceof ErrorEvent ? event.error : event;
-          if (err && err.name === "OperationError") {
-            console.warn("[ReceiveStream] Ignoring OperationError on DataChannel (likely close race).", err);
-            return;
-          }
-          try {
-            controller.error(err || new Error("RTCDataChannel error"));
-          } catch (e) {
-          }
-        };
-        this.controller.underlyingChannel.addEventListener("open", () => console.log("channel open"));
-      },
-      pull: (_controller) => {
-        this.flushCredits();
-      },
-      cancel: () => {
-        this.controller.close();
+// src/rtcfetcher/transport/webrtc-transport.ts
+var WebRTCTransport = class {
+  constructor(pc, config = {}) {
+    this.pc = pc;
+    this.config = config;
+    this.masterChannel = pc.createDataChannel("rtc-fetcher-master", { negotiated: true, id: SIGNALING_CHANNEL_ID });
+    this.negotiator = new Negotiator(this.masterChannel, pc);
+    this.poolManager = new IdPoolManager(this.negotiator, pc, config);
+    this.negotiator.onReserved = (id, channel, label) => {
+      if (this.incomingHandler) {
+        this.incomingHandler(id, channel, label);
       }
-    }, {
-      highWaterMark: this.initialCredit
-      // Match HWM to our credit window logic
+    };
+    this.opened = new Promise((resolve) => {
+      const checkOpen = () => {
+        if (this.masterChannel.readyState === "open") {
+          this.poolManager.refillPool();
+          resolve();
+          return true;
+        }
+        return false;
+      };
+      if (!checkOpen()) {
+        this.masterChannel.addEventListener("open", () => checkOpen());
+      }
     });
   }
-  flushCredits() {
-    if (this.unacknowledgedBytes > 0) {
-      console.log(`[ReceiveStream] Flushing credits: ${this.unacknowledgedBytes}`);
-      this.controller.sendCredit(this.unacknowledgedBytes);
-      this.unacknowledgedBytes = 0;
-    }
+  onIncomingChannel(handler) {
+    this.incomingHandler = handler;
   }
-  get readable() {
-    return this.stream;
+  async reserveId(label, excluded) {
+    return this.poolManager.reserveId(label, excluded);
+  }
+  createChannel(label, id) {
+    return this.poolManager.getOrCreateChannel(label, id);
+  }
+  async sendReadySignal(id, label) {
+    return this.negotiator.sendReady(id, label);
   }
 };
 
@@ -1225,8 +1032,7 @@ var qpack_static_table_entries = [
 // src/rtcfetcher/qpack/qpack.ts
 function encodeQpack(headers, context) {
   const out = [];
-  let requiredInsertCount = 0;
-  const fieldLines = [];
+  const ops = [];
   let maxDynamicIndexUsed = -1;
   for (const h of headers) {
     const nameLc = h.name.toLowerCase();
@@ -1253,62 +1059,67 @@ function encodeQpack(headers, context) {
       }
     }
     if (bestStaticIndex !== -1) {
-      const enc = encodeInt(bestStaticIndex, 6);
-      fieldLines.push(128 | 64 | enc[0], ...enc.slice(1));
+      ops.push({ type: "indexed", index: bestStaticIndex, static: true });
       continue;
     }
     if (bestDynamicIndex !== -1) {
-      const currentInsertCount = context.remoteTable.getInsertedCount();
-      if (bestDynamicIndex > maxDynamicIndexUsed) {
-        maxDynamicIndexUsed = bestDynamicIndex;
-      }
-      const relativeIndex = currentInsertCount - 1 - bestDynamicIndex;
-      const enc = encodeInt(relativeIndex, 6);
-      fieldLines.push(128 | 0 | enc[0], ...enc.slice(1));
+      if (bestDynamicIndex > maxDynamicIndexUsed) maxDynamicIndexUsed = bestDynamicIndex;
+      ops.push({ type: "indexed", index: bestDynamicIndex, static: false });
       continue;
     }
     const isStreamRef = valueStr.startsWith("::streamref::");
     if (context && !isStreamRef) {
       const absIndex = context.insertToDynamicTable(nameLc, valueStr);
-      if (absIndex > maxDynamicIndexUsed) {
-        maxDynamicIndexUsed = absIndex;
-      }
-      const currentInsertCount = context.remoteTable.getInsertedCount();
-      const relativeIndex = currentInsertCount - 1 - absIndex;
-      const enc = encodeInt(relativeIndex, 6);
-      fieldLines.push(128 | enc[0], ...enc.slice(1));
+      if (absIndex > maxDynamicIndexUsed) maxDynamicIndexUsed = absIndex;
+      ops.push({ type: "indexed", index: absIndex, static: false });
       continue;
     }
     if (bestStaticNameMatch !== -1) {
-      const enc = encodeInt(bestStaticNameMatch, 4);
-      fieldLines.push(64 | 16 | enc[0], ...enc.slice(1));
-      const valBytes = new TextEncoder().encode(valueStr);
-      const valLen = encodeInt(valBytes.length, 7);
-      fieldLines.push(...valLen, ...valBytes);
+      ops.push({ type: "literal_nameref", index: bestStaticNameMatch, static: true, value: valueStr });
     } else if (bestDynamicNameMatch !== -1) {
       if (bestDynamicNameMatch > maxDynamicIndexUsed) maxDynamicIndexUsed = bestDynamicNameMatch;
-      const currentInsertCount = context.remoteTable.getInsertedCount();
-      const relativeIndex = currentInsertCount - 1 - bestDynamicNameMatch;
-      const enc = encodeInt(relativeIndex, 4);
-      fieldLines.push(64 | 0 | enc[0], ...enc.slice(1));
-      const valBytes = new TextEncoder().encode(valueStr);
-      const valLen = encodeInt(valBytes.length, 7);
-      fieldLines.push(...valLen, ...valBytes);
+      ops.push({ type: "literal_nameref", index: bestDynamicNameMatch, static: false, value: valueStr });
     } else {
-      const nameBytes = new TextEncoder().encode(nameLc);
-      const nameLen = encodeInt(nameBytes.length, 3);
-      fieldLines.push(32 | nameLen[0], ...nameLen.slice(1), ...nameBytes);
-      const valBytes = new TextEncoder().encode(valueStr);
-      const valLen = encodeInt(valBytes.length, 7);
-      fieldLines.push(...valLen, ...valBytes);
+      ops.push({ type: "literal", name: nameLc, value: valueStr });
     }
   }
-  requiredInsertCount = maxDynamicIndexUsed === -1 ? 0 : maxDynamicIndexUsed + 1;
+  const requiredInsertCount = maxDynamicIndexUsed === -1 ? 0 : maxDynamicIndexUsed + 1;
+  const baseIndex = requiredInsertCount;
   const ricEnc = encodeInt(requiredInsertCount, 8);
   out.push(...ricEnc);
   const dbEnc = encodeInt(0, 7);
   out.push(0 | dbEnc[0], ...dbEnc.slice(1));
-  out.push(...fieldLines);
+  for (const op of ops) {
+    if (op.type === "indexed") {
+      if (op.static) {
+        const enc = encodeInt(op.index, 6);
+        out.push(128 | 64 | enc[0], ...enc.slice(1));
+      } else {
+        const relativeIndex = baseIndex - 1 - op.index;
+        const enc = encodeInt(relativeIndex, 6);
+        out.push(128 | 0 | enc[0], ...enc.slice(1));
+      }
+    } else if (op.type === "literal_nameref") {
+      if (op.static) {
+        const enc = encodeInt(op.index, 4);
+        out.push(64 | 16 | enc[0], ...enc.slice(1));
+      } else {
+        const relativeIndex = baseIndex - 1 - op.index;
+        const enc = encodeInt(relativeIndex, 4);
+        out.push(64 | 0 | enc[0], ...enc.slice(1));
+      }
+      const valBytes = new TextEncoder().encode(op.value);
+      const valLen = encodeInt(valBytes.length, 7);
+      out.push(...valLen, ...valBytes);
+    } else {
+      const nameBytes = new TextEncoder().encode(op.name);
+      const nameLen = encodeInt(nameBytes.length, 3);
+      out.push(32 | nameLen[0], ...nameLen.slice(1), ...nameBytes);
+      const valBytes = new TextEncoder().encode(op.value);
+      const valLen = encodeInt(valBytes.length, 7);
+      out.push(...valLen, ...valBytes);
+    }
+  }
   return new Uint8Array(out);
 }
 function decodeQpack(buf, context) {
@@ -1534,6 +1345,7 @@ function encodeEncoderInstruction(inst) {
 // src/rtcfetcher/qpack/qpack-context.ts
 var QpackContext = class {
   constructor() {
+    this.pendingWaiters = [];
     this.localTable = new DynamicTable(4096);
     this.remoteTable = new DynamicTable(4096);
   }
@@ -1557,11 +1369,64 @@ var QpackContext = class {
     }
     return this.remoteTable.getInsertedCount() - 1;
   }
+  waitForInsertCount(required) {
+    if (this.localTable.getInsertedCount() >= required) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      this.pendingWaiters.push({ count: required, resolve });
+    });
+  }
+  checkWaiters() {
+    const current = this.localTable.getInsertedCount();
+    const remaining = [];
+    for (const w of this.pendingWaiters) {
+      if (current >= w.count) {
+        w.resolve();
+      } else {
+        remaining.push(w);
+      }
+    }
+    this.pendingWaiters = remaining;
+  }
   // Decoder Logic: Handle incoming instructions from Remote Encoder
   setupDecoderStreamHandler() {
     if (!this.decoderStream) return;
     this.decoderStream.onmessage = (ev) => {
       const data = new Uint8Array(ev.data);
+      let pos = 0;
+      while (pos < data.length) {
+        const byte = data[pos];
+        if ((byte & 192) === 64) {
+          const nameLenDec = decodeVarInt(data, 5, pos);
+          const nameLen = nameLenDec.value;
+          let curr = nameLenDec.next;
+          if (curr + nameLen > data.length) {
+            console.warn("[QPACK Decoder] Name truncated");
+            return;
+          }
+          const nameBytes = data.subarray(curr, curr + nameLen);
+          const name = new TextDecoder().decode(nameBytes);
+          curr += nameLen;
+          if (curr >= data.length) return;
+          const valLenDec = decodeVarInt(data, 7, curr);
+          const valLen = valLenDec.value;
+          curr = valLenDec.next;
+          if (curr + valLen > data.length) {
+            console.warn("[QPACK Decoder] Value truncated");
+            return;
+          }
+          const valBytes = data.subarray(curr, curr + valLen);
+          const value = new TextDecoder().decode(valBytes);
+          curr += valLen;
+          const idx = this.localTable.insert(name, value);
+          this.checkWaiters();
+          pos = curr;
+        } else {
+          console.warn(`[QPACK Decoder] Unknown instruction byte: ${byte.toString(16)}`);
+          break;
+        }
+      }
     };
   }
 };
@@ -1646,24 +1511,372 @@ var QpackCodec = class {
       throw new RTCSerializationError("Failed to encode data with QPACK", error);
     }
   }
-  decode(data) {
-    try {
-      const headers = decodeQpack(data, this.context);
-      return this.inflateHeaders(headers);
-    } catch (error) {
-      throw new RTCSerializationError("Failed to decode QPACK data", error);
+  async decode(data) {
+    while (true) {
+      try {
+        const headers = decodeQpack(data, this.context);
+        return this.inflateHeaders(headers);
+      } catch (error) {
+        const msg = error.message || "";
+        if (msg.startsWith("QPACK Blocked")) {
+          const match = msg.match(/Required Insert Count (\d+)/);
+          if (match) {
+            const required = parseInt(match[1], 10);
+            await this.context.waitForInsertCount(required);
+            continue;
+          }
+        }
+        throw new RTCSerializationError("Failed to decode QPACK data", error);
+      }
     }
   }
 };
 var qpackCodec = new QpackCodec();
 
+// src/rtcfetcher/core/protocol-handler.ts
+var ProtocolHandler = class {
+  static isStreamChannel(label) {
+    return label === this.LABEL_STREAM || label === this.LABEL_RES_STREAM;
+  }
+  static isRequestChannel(label) {
+    return label.startsWith(this.PREFIX_REQUEST) || !this.isStreamChannel(label) && label !== "default";
+  }
+  static parseRequestLabel(label) {
+    if (!label) return "default";
+    if (label.startsWith(this.PREFIX_REQUEST)) {
+      return label.substring(this.PREFIX_REQUEST.length);
+    }
+    return label;
+  }
+  static formatRequestLabel(endpoint) {
+    return this.PREFIX_REQUEST + endpoint;
+  }
+  static get REQUEST_PREFIX() {
+    return this.PREFIX_REQUEST;
+  }
+  static get STREAM_LABEL() {
+    return this.LABEL_STREAM;
+  }
+  static get RES_STREAM_LABEL() {
+    return this.LABEL_RES_STREAM;
+  }
+};
+ProtocolHandler.PREFIX_REQUEST = "req::";
+ProtocolHandler.LABEL_STREAM = "stream";
+ProtocolHandler.LABEL_RES_STREAM = "res-stream";
+
+// src/datachannelstream/framing/constants.ts
+var MSG_TYPE_DATA = 1;
+var MSG_TYPE_CREDIT = 2;
+var DEFAULT_INITIAL_WINDOW = 65536;
+var HEADER_SIZE = 1;
+var CREDIT_PAYLOAD_SIZE = 4;
+
+// src/datachannelstream/framing/channel-controller.ts
+var DataChannelController = class {
+  constructor(channel) {
+    this.channel = channel;
+    this.pendingCredit = 0;
+    this.instanceId = Math.random().toString(36).substring(7);
+    this.channel.binaryType = "arraybuffer";
+    this.channel.onmessage = this.handleMessage.bind(this);
+  }
+  set onCredit(handler) {
+    this._onCredit = handler;
+    if (handler && this.pendingCredit > 0) {
+      handler(this.pendingCredit);
+      this.pendingCredit = 0;
+    }
+  }
+  get onCredit() {
+    return this._onCredit;
+  }
+  get readyState() {
+    return this.channel.readyState;
+  }
+  get bufferedAmount() {
+    return this.channel.bufferedAmount;
+  }
+  get underlyingChannel() {
+    return this.channel;
+  }
+  sendData(data) {
+    if (this.channel.readyState !== "open") {
+      console.warn(`[DataChannelController:${this.channel.id}:${this.instanceId}] Attempted sendData on non-open channel (${this.channel.readyState})`);
+      return;
+    }
+    const frame = new Uint8Array(HEADER_SIZE + data.byteLength);
+    frame[0] = MSG_TYPE_DATA;
+    frame.set(data, HEADER_SIZE);
+    try {
+      this.channel.send(frame);
+    } catch (e) {
+      console.error(`[DataChannelController:${this.channel.id}:${this.instanceId}] sendData failed`, e);
+      throw e;
+    }
+  }
+  sendCredit(amount) {
+    if (this.channel.readyState !== "open") {
+      return;
+    }
+    const frame = new Uint8Array(HEADER_SIZE + CREDIT_PAYLOAD_SIZE);
+    frame[0] = MSG_TYPE_CREDIT;
+    const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+    view.setUint32(HEADER_SIZE, amount, true);
+    try {
+      this.channel.send(frame);
+    } catch (e) {
+      console.error(`[DataChannelController:${this.channel.id}:${this.instanceId}] sendCredit failed`, e);
+    }
+  }
+  close() {
+    this.channel.close();
+  }
+  error(e) {
+    console.error(`[DataChannelController:${this.channel.id}:${this.instanceId}] Error reported:`, e);
+  }
+  handleMessage(event) {
+    const data = event.data;
+    if (data instanceof ArrayBuffer) {
+      this.processBuffer(new Uint8Array(data));
+    } else if (data instanceof Uint8Array) {
+      this.processBuffer(data);
+    } else {
+      console.warn(`[DataChannelController:${this.channel.id}:${this.instanceId}] Received non-binary data, ignoring.`);
+    }
+  }
+  processBuffer(buffer) {
+    if (buffer.byteLength < HEADER_SIZE) return;
+    const type = buffer[0];
+    if (type === MSG_TYPE_DATA) {
+      if (this.onData) {
+        this.onData(buffer.subarray(HEADER_SIZE));
+      } else {
+        console.warn(`[DataChannelController:${this.channel.id}:${this.instanceId}] No onData handler! Dropping data.`);
+      }
+    } else if (type === MSG_TYPE_CREDIT) {
+      if (buffer.byteLength < HEADER_SIZE + CREDIT_PAYLOAD_SIZE) return;
+      const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+      const credit = view.getUint32(HEADER_SIZE, true);
+      if (this._onCredit) {
+        this._onCredit(credit);
+      } else {
+        this.pendingCredit += credit;
+      }
+    } else {
+      console.warn(`[DataChannelController:${this.channel.id}:${this.instanceId}] Unknown message type:`, type);
+    }
+  }
+};
+
+// src/datachannelstream/streams/sendStream.ts
+var SendStream = class {
+  constructor(channelOrController, highWaterMark = DEFAULT_INITIAL_WINDOW) {
+    this.highWaterMark = highWaterMark;
+    this.sendWindow = 0;
+    // Starts at 0, waits for initial credit from Receiver.
+    this.creditResolvers = [];
+    this.maxChunkSize = 16 * 1024;
+    if ("sendCredit" in channelOrController && typeof channelOrController.sendCredit === "function") {
+      this.controller = channelOrController;
+    } else {
+      this.controller = new DataChannelController(channelOrController);
+    }
+    this.controller.onCredit = (amount) => {
+      this.sendWindow += amount;
+      this.processPendingWrites();
+    };
+    this.stream = new WritableStream({
+      write: this.writeChunk.bind(this),
+      close: async () => {
+        if (this.controller.bufferedAmount > 0) {
+          await this.waitForBufferedAmountLow();
+        }
+        await new Promise((r) => setTimeout(r, 50));
+        this.controller.close();
+      },
+      abort: () => {
+        this.controller.close();
+      }
+    });
+  }
+  get writable() {
+    return this.stream;
+  }
+  async write(data) {
+    if (!this.writer) {
+      this.writer = this.stream.getWriter();
+    }
+    return this.writer.write(data);
+  }
+  async close() {
+    if (!this.writer) {
+      if (this.stream.locked) {
+        return;
+      }
+      this.writer = this.stream.getWriter();
+    }
+    return this.writer.close();
+  }
+  // 16KB MTU limit
+  async writeChunk(chunk) {
+    if (this.controller.readyState !== "open") {
+      await new Promise((resolve, reject) => {
+        if (this.controller.readyState === "open") return resolve();
+        const onOpen = () => {
+          cleanup();
+          resolve();
+        };
+        const onError = (e) => {
+          cleanup();
+          const err = e.error || new Error("DataChannel error during wait for open");
+          reject(err);
+        };
+        const onClose = () => {
+          cleanup();
+          reject(new Error("DataChannel closed before open"));
+        };
+        const cleanup = () => {
+          this.controller.underlyingChannel.removeEventListener("open", onOpen);
+          this.controller.underlyingChannel.removeEventListener("error", onError);
+          this.controller.underlyingChannel.removeEventListener("close", onClose);
+        };
+        this.controller.underlyingChannel.addEventListener("open", onOpen);
+        this.controller.underlyingChannel.addEventListener("error", onError);
+        this.controller.underlyingChannel.addEventListener("close", onClose);
+      });
+    }
+    let offset = 0;
+    while (offset < chunk.byteLength) {
+      const remaining = chunk.byteLength - offset;
+      while (this.sendWindow === 0) {
+        await this.waitForCredit();
+      }
+      const toSendSize = Math.min(remaining, this.sendWindow, this.maxChunkSize);
+      const slice = chunk.subarray(offset, offset + toSendSize);
+      if (this.controller.bufferedAmount > this.highWaterMark) {
+        await this.waitForBufferedAmountLow();
+      }
+      try {
+        this.controller.sendData(slice);
+        this.sendWindow -= toSendSize;
+        offset += toSendSize;
+      } catch (error) {
+        console.error("SendStream failed to send:", error);
+        throw error;
+      }
+    }
+  }
+  waitForCredit() {
+    return new Promise((resolve) => {
+      this.creditResolvers.push(resolve);
+    });
+  }
+  processPendingWrites() {
+    while (this.creditResolvers.length > 0 && this.sendWindow > 0) {
+      const resolver = this.creditResolvers.shift();
+      if (resolver) resolver();
+    }
+  }
+  waitForBufferedAmountLow() {
+    return new Promise((resolve) => {
+      const handler = () => {
+        this.controller.underlyingChannel.removeEventListener("bufferedamountlow", handler);
+        resolve();
+      };
+      this.controller.underlyingChannel.addEventListener("bufferedamountlow", handler);
+    });
+  }
+};
+
+// src/datachannelstream/streams/receiveStream.ts
+var ReceiveStream = class {
+  constructor(channelOrController) {
+    this.unacknowledgedBytes = 0;
+    this.initialCredit = DEFAULT_INITIAL_WINDOW;
+    if ("sendCredit" in channelOrController && typeof channelOrController.sendCredit === "function") {
+      this.controller = channelOrController;
+    } else {
+      this.controller = new DataChannelController(channelOrController);
+    }
+    this.stream = new ReadableStream({
+      start: (controller) => {
+        const init = () => {
+          this.controller.sendCredit(this.initialCredit);
+          this.controller.onData = (data) => {
+            controller.enqueue(data);
+            this.unacknowledgedBytes += data.byteLength;
+            if (controller.desiredSize !== null && controller.desiredSize > 0) {
+              this.flushCredits();
+            }
+          };
+        };
+        if (this.controller.readyState === "open") {
+          init();
+        } else {
+          const onOpen = () => {
+            this.controller.underlyingChannel.removeEventListener("open", onOpen);
+            init();
+          };
+          this.controller.underlyingChannel.addEventListener("open", onOpen);
+        }
+        this.controller.underlyingChannel.onclose = () => {
+          try {
+            controller.close();
+          } catch (e) {
+          }
+        };
+        this.controller.underlyingChannel.onerror = (event) => {
+          const err = event instanceof ErrorEvent ? event.error : event;
+          if (err && err.name === "OperationError") {
+            return;
+          }
+          try {
+            controller.error(err || new Error("RTCDataChannel error"));
+          } catch (e) {
+          }
+        };
+      },
+      pull: (_controller) => {
+        this.flushCredits();
+      },
+      cancel: () => {
+        this.controller.close();
+      }
+    }, new ByteLengthQueuingStrategy({ highWaterMark: this.initialCredit }));
+  }
+  flushCredits() {
+    if (this.unacknowledgedBytes > 0) {
+      this.controller.sendCredit(this.unacknowledgedBytes);
+      this.unacknowledgedBytes = 0;
+    }
+  }
+  get readable() {
+    return this.stream;
+  }
+};
+
+// src/rtcfetcher/core/stream-factory.ts
+var StreamFactory = class {
+  createSendStream(channel, minBufferSize) {
+    return new SendStream(channel, minBufferSize);
+  }
+  createReceiveStream(channel) {
+    return new ReceiveStream(channel);
+  }
+  createController(channel) {
+    return new DataChannelController(channel);
+  }
+};
+
 // src/rtcfetcher/core/rtc-response.ts
 var RTCResponse = class {
-  constructor(body, streamReplacer) {
+  constructor(body, streamReplacer, stats) {
     // Cache for rehydrated streams to ensure we return the same instance
     this._streamCache = /* @__PURE__ */ new Map();
     this._body = body;
     this._streamReplacer = streamReplacer;
+    this._stats = stats;
     return new Proxy(this, {
       get: (target, prop, receiver) => {
         if (prop in target) {
@@ -1705,6 +1918,9 @@ var RTCResponse = class {
     }
     this._streamCache.set(ref.id, stream);
     return stream;
+  }
+  get qpackStats() {
+    return this._stats;
   }
   get ok() {
     return true;
@@ -1832,6 +2048,9 @@ function uint8ArrayToStream(data) {
   });
 }
 function stringToStream(str) {
+  if (typeof Blob !== "undefined") {
+    return new Blob([str]).stream();
+  }
   const encoder = new TextEncoder();
   const data = encoder.encode(str);
   return uint8ArrayToStream(data);
@@ -1839,22 +2058,27 @@ function stringToStream(str) {
 
 // src/rtcfetcher/core/rtcfetcher.ts
 var RTCFetcher = class {
-  constructor(pc, config) {
-    this.pc = pc;
+  constructor(pcOrTransport, config, codec, streamFactory) {
     // Cache reserved channels (streams) to avoid collisions
     this.reservedChannels = /* @__PURE__ */ new Map();
-    // ID Pool for 0-RTT negotiation (Stores Physical Channel Objects)
-    this.idPool = [];
     // Pending Queue for Backpressure
     this.pendingChannelQueue = [];
     this.config = config || {};
-    this.masterChannel = pc.createDataChannel("rtc-fetcher-master", { negotiated: true, id: 0 });
-    this.negotiator = new Negotiator(this.masterChannel, pc);
-    this.qpackEncoderStream = pc.createDataChannel("qpack-encoder", { negotiated: true, id: 1 });
-    this.qpackDecoderStream = pc.createDataChannel("qpack-decoder", { negotiated: true, id: 2 });
-    this.qpackContext = new QpackContext();
-    this.qpackContext.attachChannels(this.qpackEncoderStream, this.qpackDecoderStream);
-    this.qpackCodec = new QpackCodec(this.qpackContext);
+    this.streamFactory = streamFactory || new StreamFactory();
+    if ("createDataChannel" in pcOrTransport) {
+      const pc = pcOrTransport;
+      this.transport = new WebRTCTransport(pc, { prefetchPoolSize: this.config.prefetchPoolSize });
+      const qpackInstructionStream = this.transport.createChannel("qpack-instructions", 1);
+      const qpackContext = new QpackContext();
+      qpackContext.attachChannels(qpackInstructionStream, qpackInstructionStream);
+      this.codec = new QpackCodec(qpackContext);
+    } else {
+      this.transport = pcOrTransport;
+      if (!codec) {
+        throw new Error("Codec must be provided when using custom transport");
+      }
+      this.codec = codec;
+    }
     this.incomingRequests = new ReadableStream({
       start: (controller) => {
         this.incomingRequestsController = controller;
@@ -1865,58 +2089,18 @@ var RTCFetcher = class {
     }, {
       highWaterMark: this.config.incomingHighWaterMark ?? 5
     });
-    this.negotiator.onReserved = (id, channel, label) => this.handleReservedChannel(id, channel, label);
-    this.opened = new Promise((resolve) => {
-      const checkOpen = () => {
-        if (this.masterChannel.readyState === "open" && this.qpackEncoderStream.readyState === "open" && this.qpackDecoderStream.readyState === "open") {
-          this.refillPool();
-          resolve();
-          return true;
-        }
-        return false;
-      };
-      if (!checkOpen()) {
-        const handler = () => checkOpen();
-        this.masterChannel.addEventListener("open", handler);
-        this.qpackEncoderStream.addEventListener("open", handler);
-        this.qpackDecoderStream.addEventListener("open", handler);
-      }
-    });
+    this.transport.onIncomingChannel((id, channel, label) => this.handleReservedChannel(id, channel, label));
+    this.opened = this.transport.opened;
   }
-  async refillPool() {
-    const targetSize = this.config.prefetchPoolSize ?? 5;
-    if (this.idPool.length >= targetSize) return;
-    console.log(`[RTCFetcher] Refilling ID Pool (Current: ${this.idPool.length}, Target: ${targetSize})`);
-    while (this.idPool.length < targetSize) {
-      try {
-        const excluded = /* @__PURE__ */ new Set([1, 2, ...this.reservedChannels.keys(), ...this.idPool.map((p) => p.id)]);
-        const id = await this.negotiator.reserveId("__pooled__", excluded);
-        const channel = this.pc.createDataChannel("__pooled__", { negotiated: true, id });
-        console.log(`[RTCFetcher] Created Pooled Channel ID: ${id}`);
-        this.idPool.push({ id, channel });
-      } catch (e) {
-        console.warn("[RTCFetcher] Failed to refill ID pool:", e);
-        break;
-      }
-    }
-  }
-  handleReservedChannel(id, existingChannel, label) {
+  handleReservedChannel(id, channel, label) {
     try {
-      if (label && (label === "stream" || label === "res-stream")) {
-        if (existingChannel) {
-          console.log(`[RTCFetcher] Storing reserved channel for ID ${id} (Label: ${label})`);
-          this.reservedChannels.set(id, existingChannel);
-        } else {
-          console.warn(`[RTCFetcher] Stream ID ${id} reserved but no existing channel passed! (Label: ${label})`);
-        }
+      if (label && ProtocolHandler.isStreamChannel(label)) {
+        console.log(`[RTCFetcher] Storing reserved channel for ID ${id} (Label: ${label})`);
+        this.reservedChannels.set(id, channel);
         return;
       }
-      let endpoint = label || "default";
-      if (endpoint.startsWith("req::")) {
-        endpoint = endpoint.substring(5);
-      }
+      let endpoint = ProtocolHandler.parseRequestLabel(label);
       console.log(`[RTCFetcher] Handle Req Channel ID: ${id}, Label: ${endpoint}`);
-      const channel = existingChannel || this.pc.createDataChannel("rtc-fetcher-req", { negotiated: true, id });
       this.pendingChannelQueue.push({ label: endpoint, channel });
       this.pumpIncomingRequests();
     } catch (e) {
@@ -1935,8 +2119,8 @@ var RTCFetcher = class {
       label,
       open: async () => {
         console.log(`[RTCFetcher] Opening Request: ${label} (ID: ${channel.id})`);
-        const controller = new DataChannelController(channel);
-        const receiveStream = new ReceiveStream(controller);
+        const controller = this.streamFactory.createController(channel);
+        const receiveStream = this.streamFactory.createReceiveStream(controller);
         const info = await this.bufferAndDecode(receiveStream.readable);
         if (!info) {
           controller.close();
@@ -1964,37 +2148,24 @@ var RTCFetcher = class {
   }
   async sendResponse(controller, data) {
     const streams = /* @__PURE__ */ new Map();
-    const preCreatedChannels = /* @__PURE__ */ new Map();
     const excludedIds = /* @__PURE__ */ new Set();
     if (controller.underlyingChannel.id !== null) {
       excludedIds.add(controller.underlyingChannel.id);
     }
     const processed = await this.traverseAndExtractStreams(data, async (stream) => {
-      let id;
-      let pooledChannel;
-      if (this.idPool.length > 0) {
-        const pooled = this.idPool.shift();
-        id = pooled.id;
-        pooledChannel = pooled.channel;
-        this.refillPool();
-      } else {
-        id = await this.negotiator.reserveId("res-stream", excludedIds);
-      }
+      const id = await this.transport.reserveId(ProtocolHandler.RES_STREAM_LABEL, excludedIds);
       excludedIds.add(id);
-      if (pooledChannel) {
-        preCreatedChannels.set(id, pooledChannel);
-      }
       streams.set(id, stream);
       return new StreamRef(id);
     });
-    const encoded = this.qpackCodec.encode(processed);
-    const sendStream = new SendStream(controller, this.config.minBufferSize);
+    const encoded = this.codec.encode(processed);
+    const sendStream = this.streamFactory.createSendStream(controller, this.config.minBufferSize);
     const streamReadyPromises = [];
     streams.forEach((stream, id) => {
-      const sChannel = preCreatedChannels.get(id) || this.pc.createDataChannel("res-stream", { negotiated: true, id });
-      const sStream = new SendStream(sChannel, this.config.minBufferSize);
+      const sChannel = this.transport.createChannel(ProtocolHandler.RES_STREAM_LABEL, id);
+      const sStream = this.streamFactory.createSendStream(sChannel, this.config.minBufferSize);
       stream.pipeTo(sStream.writable).catch((e) => console.error(e));
-      streamReadyPromises.push(this.negotiator.sendReady(id, "res-stream"));
+      streamReadyPromises.push(this.transport.sendReadySignal(id, ProtocolHandler.RES_STREAM_LABEL));
     });
     await Promise.all(streamReadyPromises);
     try {
@@ -2004,6 +2175,8 @@ var RTCFetcher = class {
       await sendStream.write(encoded);
     } catch (e) {
       console.error("Error sending response:", e);
+    } finally {
+      controller.close();
     }
   }
   async processedIncomingBody(obj) {
@@ -2011,7 +2184,7 @@ var RTCFetcher = class {
       return new ReadableStream({
         start: (controller) => {
           const channel = this.getOrOpenChannel(obj.id);
-          const s = new ReceiveStream(channel);
+          const s = this.streamFactory.createReceiveStream(channel);
           s.readable.pipeTo(new WritableStream({
             write: (c) => controller.enqueue(c),
             close: () => controller.close(),
@@ -2037,7 +2210,7 @@ var RTCFetcher = class {
       return channel;
     }
     console.log(`[RTCFetcher] getOrOpenChannel Miss: Creating new channel for ID ${id}`);
-    return this.pc.createDataChannel("stream", { negotiated: true, id });
+    return this.transport.createChannel(ProtocolHandler.STREAM_LABEL, id);
   }
   async bufferAndDecode(stream) {
     const reader = stream.getReader();
@@ -2063,7 +2236,7 @@ var RTCFetcher = class {
       const len = new DataView(header.buffer).getUint32(0, true);
       const bodyBytes = await readExact(len);
       if (!bodyBytes) return null;
-      const decoded = this.qpackCodec.decode(bodyBytes);
+      const decoded = await this.codec.decode(bodyBytes);
       if (decoded && typeof decoded === "object") {
         return decoded;
       }
@@ -2080,48 +2253,23 @@ var RTCFetcher = class {
       throw options.signal.reason || new Error("Aborted");
     }
     await this.opened;
-    let reservedId;
-    let isPooled = false;
-    let pooledChannel;
-    if (this.idPool.length > 0) {
-      const pooled = this.idPool.shift();
-      reservedId = pooled.id;
-      pooledChannel = pooled.channel;
-      console.log(`[RTCFetcher] Using Pooled ID: ${reservedId}`);
-      isPooled = true;
-      this.refillPool();
-    } else {
-      console.log(`[RTCFetcher] Pool Empty. Negotiating directly...`);
-      reservedId = await this.negotiator.findUnusedId();
-      isPooled = false;
-    }
+    const reqLabel = ProtocolHandler.formatRequestLabel(label);
+    const reservedId = await this.transport.reserveId(reqLabel, /* @__PURE__ */ new Set());
     const streams = /* @__PURE__ */ new Map();
     const streamCache = /* @__PURE__ */ new Map();
-    const preCreatedStreamChannels = /* @__PURE__ */ new Map();
-    const excludedIds = /* @__PURE__ */ new Set([reservedId, ...this.idPool.map((p) => p.id)]);
+    const excludedIds = /* @__PURE__ */ new Set([reservedId]);
     const processedBody = await this.traverseAndExtractStreams(body, async (stream) => {
       if (streamCache.has(stream)) return streamCache.get(stream);
-      let streamId;
-      if (this.idPool.length > 0) {
-        const p = this.idPool.shift();
-        streamId = p.id;
-        preCreatedStreamChannels.set(streamId, p.channel);
-        this.refillPool();
-      } else {
-        streamId = await this.negotiator.reserveId("stream", excludedIds);
-      }
+      const streamId = await this.transport.reserveId(ProtocolHandler.STREAM_LABEL, excludedIds);
       excludedIds.add(streamId);
       streams.set(streamId, stream);
       const ref = new StreamRef(streamId);
       streamCache.set(stream, ref);
       return ref;
     });
-    if (!isPooled) {
-      await this.negotiator.performHandshake(reservedId, "req::" + label);
-    }
     console.log("Reserved ID (Local):", reservedId);
-    const mainChannel = pooledChannel || this.pc.createDataChannel(label, { negotiated: true, id: reservedId });
-    const controller = new DataChannelController(mainChannel);
+    const mainChannel = this.transport.createChannel(reqLabel, reservedId);
+    const controller = this.streamFactory.createController(mainChannel);
     const signal = options?.signal;
     const abortHandler = () => {
       console.log(`[RTCFetcher] AbortSignal fired. Closing request channel ${reservedId}`);
@@ -2133,10 +2281,10 @@ var RTCFetcher = class {
         signal.removeEventListener("abort", abortHandler);
       });
     }
-    const responseReader = new ReceiveStream(controller);
-    const sendStream = new SendStream(controller, this.config.minBufferSize);
-    await this.negotiator.sendReady(reservedId, "req::" + label);
-    const encoded = this.qpackCodec.encode({ label, body: processedBody });
+    const responseReader = this.streamFactory.createReceiveStream(controller);
+    const sendStream = this.streamFactory.createSendStream(controller, this.config.minBufferSize);
+    await this.transport.sendReadySignal(reservedId, reqLabel);
+    const encoded = this.codec.encode({ label, body: processedBody });
     if (controller.readyState !== "open") {
       await new Promise((resolve, reject) => {
         const onOpen = () => {
@@ -2157,10 +2305,10 @@ var RTCFetcher = class {
     }
     const streamReadyPromises = [];
     streams.forEach((stream, id) => {
-      const channel = preCreatedStreamChannels.get(id) || this.pc.createDataChannel("stream", { negotiated: true, id });
-      const sStream = new SendStream(channel, this.config.minBufferSize);
+      const channel = this.transport.createChannel(ProtocolHandler.STREAM_LABEL, id);
+      const sStream = this.streamFactory.createSendStream(channel, this.config.minBufferSize);
       stream.pipeTo(sStream.writable).catch((e) => console.error(e));
-      streamReadyPromises.push(this.negotiator.sendReady(id, "stream"));
+      streamReadyPromises.push(this.transport.sendReadySignal(id, ProtocolHandler.STREAM_LABEL));
     });
     await Promise.all(streamReadyPromises);
     try {
@@ -2184,7 +2332,6 @@ var RTCFetcher = class {
           const take = Math.min(needed, value.byteLength);
           buf.set(value.subarray(0, take), offset);
           offset += take;
-          if (value.byteLength > take) console.warn("Excess data in response channel");
         }
         return buf;
       };
@@ -2193,12 +2340,12 @@ var RTCFetcher = class {
           const lenBuf = await readExact(4);
           const len = new DataView(lenBuf.buffer).getUint32(0, true);
           const bodyBuf = await readExact(len);
-          const resData = this.qpackCodec.decode(bodyBuf);
+          const resData = await this.codec.decode(bodyBuf);
           resolve(new RTCResponse(resData, (ref) => {
             return new ReadableStream({
               start: (c) => {
                 const ch = this.getOrOpenChannel(ref.id);
-                const rs = new ReceiveStream(ch);
+                const rs = this.streamFactory.createReceiveStream(ch);
                 rs.readable.pipeTo(new WritableStream({
                   write: (x) => c.enqueue(x),
                   close: () => c.close(),
@@ -2206,11 +2353,12 @@ var RTCFetcher = class {
                 }));
               }
             });
-          }));
+          }, { encodedSize: len }));
         } catch (e) {
           reject(e);
         } finally {
           reader.releaseLock();
+          controller.close();
         }
       })();
     });

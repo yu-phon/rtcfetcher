@@ -1,6 +1,4 @@
-
-export const MSG_TYPE_DATA = 0x01;
-export const MSG_TYPE_CREDIT = 0x02;
+import { CREDIT_PAYLOAD_SIZE, HEADER_SIZE, MSG_TYPE_CREDIT, MSG_TYPE_DATA } from './constants';
 
 export type DataHandler = (data: Uint8Array) => void;
 export type CreditHandler = (amount: number) => void;
@@ -13,17 +11,15 @@ export class DataChannelController {
 
     constructor(private readonly channel: RTCDataChannel) {
         this.instanceId = Math.random().toString(36).substring(7);
-        console.log(`[DataChannelController:${this.channel.id}:${this.instanceId}] Created. Type: ${channel.constructor?.name}`);
-        // console.trace(); // Uncomment if needed, but simple log might suffice if context is clear
+        // console.debug(`[DataChannelController:${this.channel.id}:${this.instanceId}] Created.`);
         this.channel.binaryType = 'arraybuffer';
         this.channel.onmessage = this.handleMessage.bind(this);
     }
 
     set onCredit(handler: CreditHandler | undefined) {
-        console.log(`[DataChannelController:${this.channel.id}:${this.instanceId}] Setting onCredit handler. Pending: ${this.pendingCredit}`);
         this._onCredit = handler;
         if (handler && this.pendingCredit > 0) {
-            console.log(`[DataChannelController:${this.channel.id}:${this.instanceId}] Flushing pending credit: ${this.pendingCredit}`);
+            // console.debug(`[DataChannelController:${this.channel.id}:${this.instanceId}] Flushing pending credit: ${this.pendingCredit}`);
             handler(this.pendingCredit);
             this.pendingCredit = 0;
         }
@@ -50,27 +46,26 @@ export class DataChannelController {
             console.warn(`[DataChannelController:${this.channel.id}:${this.instanceId}] Attempted sendData on non-open channel (${this.channel.readyState})`);
             return;
         }
-        const frame = new Uint8Array(1 + data.byteLength);
+        const frame = new Uint8Array(HEADER_SIZE + data.byteLength);
         frame[0] = MSG_TYPE_DATA;
-        frame.set(data, 1);
+        frame.set(data, HEADER_SIZE);
         try {
             this.channel.send(frame);
         } catch (e) {
             console.error(`[DataChannelController:${this.channel.id}:${this.instanceId}] sendData failed`, e);
-            throw e; // Re-throw to let caller handle if needed, or swallow?
-            // If we swallow, stream logic might get stuck. But if channel is broken, it will close/error anyway.
+            throw e;
         }
     }
 
     public sendCredit(amount: number): void {
         if (this.channel.readyState !== 'open') {
-            console.warn(`[DataChannelController:${this.channel.id}:${this.instanceId}] Attempted sendCredit on non-open channel (${this.channel.readyState})`);
+            // console.warn(`[DataChannelController:${this.channel.id}:${this.instanceId}] Attempted sendCredit on non-open channel`);
             return;
         }
-        const frame = new Uint8Array(1 + 4);
+        const frame = new Uint8Array(HEADER_SIZE + CREDIT_PAYLOAD_SIZE);
         frame[0] = MSG_TYPE_CREDIT;
         const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
-        view.setUint32(1, amount, true); // Little Endian
+        view.setUint32(HEADER_SIZE, amount, true); // Little Endian
         try {
             this.channel.send(frame);
         } catch (e) {
@@ -80,6 +75,12 @@ export class DataChannelController {
 
     public close(): void {
         this.channel.close();
+    }
+
+    public error(e: any): void {
+        console.error(`[DataChannelController:${this.channel.id}:${this.instanceId}] Error reported:`, e);
+        // Optionally close?
+        // this.channel.close(); 
     }
 
     private handleMessage(event: MessageEvent): void {
@@ -94,27 +95,25 @@ export class DataChannelController {
     }
 
     private processBuffer(buffer: Uint8Array): void {
-        if (buffer.byteLength < 1) return;
+        if (buffer.byteLength < HEADER_SIZE) return;
         const type = buffer[0];
 
         if (type === MSG_TYPE_DATA) {
-            // console.log(`[DataChannelController] Valid DATA frame. Len: ${buffer.byteLength}`);
             if (this.onData) {
-                this.onData(buffer.subarray(1));
+                this.onData(buffer.subarray(HEADER_SIZE));
             } else {
-                console.warn(`[DataChannelController:${this.channel.id}:${this.instanceId}] No onData handler!`);
+                console.warn(`[DataChannelController:${this.channel.id}:${this.instanceId}] No onData handler! Dropping data.`);
             }
         } else if (type === MSG_TYPE_CREDIT) {
+            if (buffer.byteLength < HEADER_SIZE + CREDIT_PAYLOAD_SIZE) return;
             const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-            const credit = view.getUint32(1, true);
-            console.log(`[DataChannelController:${this.channel.id}:${this.instanceId}] CREDIT frame. Amount: ${credit}`);
-            if (buffer.byteLength >= 5) {
-                if (this._onCredit) {
-                    this._onCredit(credit);
-                } else {
-                    console.log(`[DataChannelController:${this.channel.id}:${this.instanceId}] No onCredit handler! Buffering: ${credit}`);
-                    this.pendingCredit += credit;
-                }
+            const credit = view.getUint32(HEADER_SIZE, true);
+
+            if (this._onCredit) {
+                this._onCredit(credit);
+            } else {
+                // console.debug(`[DataChannelController:${this.channel.id}:${this.instanceId}] Buffering credit: ${credit}`);
+                this.pendingCredit += credit;
             }
         } else {
             console.warn(`[DataChannelController:${this.channel.id}:${this.instanceId}] Unknown message type:`, type);

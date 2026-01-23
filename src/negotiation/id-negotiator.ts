@@ -1,17 +1,22 @@
 import { encodeNegotiationMessage, decodeNegotiationMessage, NegotiationMessage } from './messages';
 import { RTCFetcherError } from '../rtcfetcher/errors/rtc-fetcher-error';
+import {
+    NEGOTIATION_TIMEOUT_MS,
+    READY_WAIT_TIMEOUT_MS,
+    MAX_NEGOTIATION_ATTEMPTS,
+    SAFE_MAX_CHANNEL_ID,
+    SIGNALING_CHANNEL_ID
+} from './constants';
 
 export class Negotiator {
-    private static readonly SIGNALING_CHANNEL_ID = 0;
-    private static readonly MAX_CHANNEL_ID = 65534; // SCTP limit 65535, 255 reserved
-
     private pendingReservations: Map<number, { resolve: () => void, reject: (err: Error) => void }> = new Map();
     // Reservations that are ACKed but waiting for READY from peer
-    private waitingForReady: Map<number, { channel?: RTCDataChannel, label?: string }> = new Map();
+    private waitingForReady: Map<number, { channel?: RTCDataChannel, label?: string, timer?: any }> = new Map();
 
 
     // Callback when a reservation is acknowledged by the peer (Receiver side)
-    public onReserved?: (id: number, channel?: RTCDataChannel, label?: string) => void;
+    // channel is now required because if probe failed, we would have NACKed.
+    public onReserved?: (id: number, channel: RTCDataChannel, label?: string) => void;
 
     constructor(
         private readonly signalingChannel: RTCDataChannel,
@@ -30,10 +35,8 @@ export class Negotiator {
      */
     async reserveId(label: string, excludedIds: Set<number> = new Set()): Promise<number> {
         let attempts = 0;
-        const maxAttempts = 5;
 
-
-        while (attempts < maxAttempts) {
+        while (attempts < MAX_NEGOTIATION_ATTEMPTS) {
             attempts++;
             const candidateId = await this.findUnusedId(excludedIds);
 
@@ -56,7 +59,7 @@ export class Negotiator {
             const timeout = setTimeout(() => {
                 this.pendingReservations.delete(id);
                 reject(new Error('Reservation timeout'));
-            }, 3000);
+            }, NEGOTIATION_TIMEOUT_MS);
 
             this.pendingReservations.set(id, {
                 resolve: () => {
@@ -101,13 +104,25 @@ export class Negotiator {
             }
         }
 
-        if (isUsed) {
+        if (isUsed || !probeChannel) {
             console.warn(`[Negotiator] Rejecting ID ${id} (Used or Probe Failed)`);
             this.send({ type: 'NACK', id });
         } else {
             // Tentatively "reserve" by sending ACK.
             // But WAIT for READY before triggering application logic.
-            this.waitingForReady.set(id, { channel: probeChannel, label: message.label });
+            // Add Safety Timeout: If READY never comes (e.g. peer crash), we must clean up.
+            const timeoutTimer = setTimeout(() => {
+                const pending = this.waitingForReady.get(id);
+                if (pending) {
+                    console.warn(`[Negotiator] Timeout waiting for READY on ID ${id}. Cleaning up.`);
+                    if (pending.channel && pending.channel.readyState !== 'closed') {
+                        pending.channel.close();
+                    }
+                    this.waitingForReady.delete(id);
+                }
+            }, READY_WAIT_TIMEOUT_MS);
+
+            this.waitingForReady.set(id, { channel: probeChannel, label: message.label, timer: timeoutTimer });
             this.send({ type: 'ACK', id });
 
             // NOTE: We do NOT call onReserved here anymore.
@@ -119,11 +134,14 @@ export class Negotiator {
         const id = message.id;
         const waiting = this.waitingForReady.get(id);
         if (waiting) {
+            if (waiting.timer) clearTimeout(waiting.timer);
             this.waitingForReady.delete(id);
-            if (this.onReserved) {
+            if (this.onReserved && waiting.channel) {
                 // Late Binding: Use label from READY message if provided, otherwise fallback to original label
                 const finalLabel = message.label || waiting.label;
                 this.onReserved(id, waiting.channel, finalLabel);
+            } else if (!waiting.channel) {
+                console.error(`[Negotiator] Unexpected: Ready received but no channel found for ID ${id}`);
             }
         } else {
             // Received READY for unknown ID? Maybe we already processed it or timeout.
@@ -187,16 +205,16 @@ export class Negotiator {
 
         // Dynamic limit check
         // Check both maxChannels (standard) and maxDataChannels (legacy/polyfill)
-        const sctp: any = this.pc.sctp;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const sctp = (this.pc as any).sctp;
         const max = sctp?.maxChannels ?? sctp?.maxDataChannels;
 
         // Use detected max, or fallback to 256 if undefined/null to be safe
         let limit = (max && max > 0) ? max : 256;
 
-        // Clamp to 255 as requested by user to ensure maximum compatibility
-        // (Chrome sometimes reports 65535 but fails above 255 or 2048 depending on version/network)
-        console.log(`[Negotiator] findUnusedId. Detected max: ${max}, Using limit: ${255}`);
-        if (limit > 255) limit = 255;
+        // Clamp to SAFE_MAX_CHANNEL_ID as requested by user to ensure maximum compatibility
+        console.log(`[Negotiator] findUnusedId. Detected max: ${max}, Using limit: ${SAFE_MAX_CHANNEL_ID}`);
+        if (limit > SAFE_MAX_CHANNEL_ID) limit = SAFE_MAX_CHANNEL_ID;
 
         // Randomized Search Strategy to avoid collisions between peers
         // Start at a random index and wrap around.
@@ -218,7 +236,7 @@ export class Negotiator {
             const zeroBased = (start - 1 + offset) % rangeSize;
             i = zeroBased + 1;
 
-            if (i === Negotiator.SIGNALING_CHANNEL_ID) continue; // Should be covered by range [1, limit-1], but safety check
+            if (i === SIGNALING_CHANNEL_ID) continue; // Should be covered by range [1, limit-1], but safety check
 
             if (!usedIds.has(i) && !excludedIds?.has(i)) {
                 candidate = i;

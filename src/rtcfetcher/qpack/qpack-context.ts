@@ -28,7 +28,7 @@ export class QpackContext {
     public attachChannels(encoderStream: RTCDataChannel, decoderStream: RTCDataChannel) {
         this.encoderStream = encoderStream;
         this.decoderStream = decoderStream;
-        console.log(`[QpackContext] Attached Channels. Encoder: ${encoderStream.id}, Decoder: ${decoderStream.id}, ReadyState: ${decoderStream.readyState}`);
+        // console.log(`[QpackContext] Attached Channels. Encoder: ${encoderStream.id}, Decoder: ${decoderStream.id}, ReadyState: ${decoderStream.readyState}`);
         this.setupDecoderStreamHandler();
     }
 
@@ -62,7 +62,7 @@ export class QpackContext {
             return Promise.resolve();
         }
         return new Promise<void>((resolve) => {
-            console.log(`[QpackContext] Waiting for Insert Count ${required} (Current: ${this.localTable.getInsertedCount()})`);
+            // console.log(`[QpackContext] Waiting for Insert Count ${required} (Current: ${this.localTable.getInsertedCount()})`);
             this.pendingWaiters.push({ count: required, resolve });
         });
     }
@@ -85,7 +85,7 @@ export class QpackContext {
     private setupDecoderStreamHandler() {
         if (!this.decoderStream) return;
         this.decoderStream.onmessage = (ev) => {
-            console.log(`[QPACK Decoder] Received ${ev.data.byteLength} bytes on stream ${this.decoderStream?.id}`);
+            // console.log(`[QPACK Decoder] Received ${ev.data.byteLength} bytes on stream ${this.decoderStream?.id}`);
             const data = new Uint8Array(ev.data as ArrayBuffer);
             let pos = 0;
             while (pos < data.length) {

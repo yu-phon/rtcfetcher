@@ -33,9 +33,10 @@ export class RTCResponse {
                 }
 
                 // 2. Fallback: Access property on _body
-                console.log(`[RTCResponse Proxy] Accessing: ${String(prop)}`);
+                // 2. Fallback: Access property on _body
+                // console.log(`[RTCResponse Proxy] Accessing: ${String(prop)}`);
                 const bodyVal = target._body ? target._body[prop] : undefined;
-                console.log(`[RTCResponse Proxy] Value:`, bodyVal);
+                // console.log(`[RTCResponse Proxy] Value:`, bodyVal);
                 return target._wrapValue(bodyVal);
             }
         });

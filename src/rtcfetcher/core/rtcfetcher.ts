@@ -4,9 +4,9 @@ import { WebRTCTransport } from '../transport/webrtc-transport';
 import { QpackCodec } from '../qpack/qpack-codec';
 import { QpackContext } from '../qpack/qpack-context';
 
-import { SendStream } from '../../datachannelstream/streams/sendStream';
-import { ReceiveStream } from '../../datachannelstream/streams/receiveStream';
-import { DataChannelController } from '../../datachannelstream/framing/channel-controller';
+import { SendStream, ReceiveStream, DataChannelController } from '../../datachannelstream';
+import { ProtocolHandler } from './protocol-handler';
+import { StreamFactory, IStreamFactory } from './stream-factory';
 import { StreamRef } from '../types/stream-ref';
 import { IncomingRequest } from '../types/message';
 import { RTCResponse } from './rtc-response';
@@ -28,6 +28,7 @@ export class RTCFetcher {
 
     // Codec
     private codec: ICodec;
+    private streamFactory: IStreamFactory;
 
     // Stream exposing incoming requests
     readonly incomingRequests: ReadableStream<IncomingRequest>;
@@ -44,9 +45,11 @@ export class RTCFetcher {
     constructor(
         pcOrTransport: RTCPeerConnection | ITransport,
         config?: RTCFetcherConfig,
-        codec?: ICodec
+        codec?: ICodec,
+        streamFactory?: IStreamFactory
     ) {
         this.config = config || {};
+        this.streamFactory = streamFactory || new StreamFactory();
 
         if ('createDataChannel' in pcOrTransport) {
             // Legacy Constructor: RTCPeerConnection
@@ -104,7 +107,7 @@ export class RTCFetcher {
     private handleReservedChannel(id: number, channel: RTCDataChannel, label?: string) {
         try {
             // Check label to distinguish Request Channel vs Stream Channel
-            if (label && (label === 'stream' || label === 'res-stream')) {
+            if (label && ProtocolHandler.isStreamChannel(label)) {
                 // This is a stream channel. Do NOT process as Request.
                 console.log(`[RTCFetcher] Storing reserved channel for ID ${id} (Label: ${label})`);
                 this.reservedChannels.set(id, channel);
@@ -112,10 +115,7 @@ export class RTCFetcher {
             }
 
             // Request Channel Logic
-            let endpoint = label || 'default';
-            if (endpoint.startsWith('req::')) {
-                endpoint = endpoint.substring(5);
-            }
+            let endpoint = ProtocolHandler.parseRequestLabel(label);
 
             console.log(`[RTCFetcher] Handle Req Channel ID: ${id}, Label: ${endpoint}`);
 
@@ -150,8 +150,8 @@ export class RTCFetcher {
                 // LAZY READ START
                 console.log(`[RTCFetcher] Opening Request: ${label} (ID: ${channel.id})`);
 
-                const controller = new DataChannelController(channel);
-                const receiveStream = new ReceiveStream(controller);
+                const controller = this.streamFactory.createController(channel);
+                const receiveStream = this.streamFactory.createReceiveStream(controller);
 
                 // Read Body
                 const info = await this.bufferAndDecode(receiveStream.readable);
@@ -196,7 +196,7 @@ export class RTCFetcher {
         const processed = await this.traverseAndExtractStreams(data, async (stream) => {
             // Reserve ID via Transport
             // Note: Transport manages pool.
-            const id = await this.transport.reserveId('res-stream', excludedIds);
+            const id = await this.transport.reserveId(ProtocolHandler.RES_STREAM_LABEL, excludedIds);
             excludedIds.add(id);
 
             streams.set(id, stream);
@@ -204,16 +204,16 @@ export class RTCFetcher {
         });
 
         const encoded = this.codec.encode(processed);
-        const sendStream = new SendStream(controller, this.config.minBufferSize);
+        const sendStream = this.streamFactory.createSendStream(controller, this.config.minBufferSize);
 
         // Open stream channels and Signal READY
         const streamReadyPromises: Promise<void>[] = [];
         streams.forEach((stream, id) => {
-            const sChannel = this.transport.createChannel('res-stream', id);
-            const sStream = new SendStream(sChannel, this.config.minBufferSize);
+            const sChannel = this.transport.createChannel(ProtocolHandler.RES_STREAM_LABEL, id);
+            const sStream = this.streamFactory.createSendStream(sChannel, this.config.minBufferSize);
             stream.pipeTo(sStream.writable).catch(e => console.error(e));
 
-            streamReadyPromises.push(this.transport.sendReadySignal(id, 'res-stream'));
+            streamReadyPromises.push(this.transport.sendReadySignal(id, ProtocolHandler.RES_STREAM_LABEL));
         });
         await Promise.all(streamReadyPromises);
 
@@ -235,7 +235,7 @@ export class RTCFetcher {
             return new ReadableStream({
                 start: (controller) => {
                     const channel = this.getOrOpenChannel(obj.id);
-                    const s = new ReceiveStream(channel);
+                    const s = this.streamFactory.createReceiveStream(channel);
                     s.readable.pipeTo(new WritableStream({
                         write: c => controller.enqueue(c),
                         close: () => controller.close(),
@@ -264,7 +264,7 @@ export class RTCFetcher {
         }
         console.log(`[RTCFetcher] getOrOpenChannel Miss: Creating new channel for ID ${id}`);
         // Use default label 'stream' for anonymous streams
-        return this.transport.createChannel('stream', id);
+        return this.transport.createChannel(ProtocolHandler.STREAM_LABEL, id);
     }
 
     private async bufferAndDecode(stream: ReadableStream<Uint8Array>): Promise<{ label: string, body: any } | null> {
@@ -320,7 +320,7 @@ export class RTCFetcher {
         // Negotiator inside transport knows about its own pool + getStats.
         // It might NOT know about "ids we are about to use for streams" in this very request.
         // But here we reserve Req ID first.
-        const reqLabel = 'req::' + label;
+        const reqLabel = ProtocolHandler.formatRequestLabel(label);
         const reservedId = await this.transport.reserveId(reqLabel, new Set());
 
         // 2. Prepare Body
@@ -332,7 +332,7 @@ export class RTCFetcher {
         const processedBody = await this.traverseAndExtractStreams(body, async (stream) => {
             if (streamCache.has(stream)) return streamCache.get(stream)!;
 
-            const streamId = await this.transport.reserveId('stream', excludedIds);
+            const streamId = await this.transport.reserveId(ProtocolHandler.STREAM_LABEL, excludedIds);
 
             excludedIds.add(streamId);
             streams.set(streamId, stream);
@@ -344,7 +344,7 @@ export class RTCFetcher {
         // 3. Create Channel
         console.log("Reserved ID (Local):", reservedId);
         const mainChannel = this.transport.createChannel(reqLabel, reservedId);
-        const controller = new DataChannelController(mainChannel);
+        const controller = this.streamFactory.createController(mainChannel);
 
         // Abort Logic
         const signal = options?.signal;
@@ -359,8 +359,8 @@ export class RTCFetcher {
             });
         }
 
-        const responseReader = new ReceiveStream(controller);
-        const sendStream = new SendStream(controller, this.config.minBufferSize);
+        const responseReader = this.streamFactory.createReceiveStream(controller);
+        const sendStream = this.streamFactory.createSendStream(controller, this.config.minBufferSize);
 
         // 4. Signal Ready
         await this.transport.sendReadySignal(reservedId, reqLabel);
@@ -382,10 +382,10 @@ export class RTCFetcher {
 
         const streamReadyPromises: Promise<void>[] = [];
         streams.forEach((stream, id) => {
-            const channel = this.transport.createChannel('stream', id);
-            const sStream = new SendStream(channel, this.config.minBufferSize);
+            const channel = this.transport.createChannel(ProtocolHandler.STREAM_LABEL, id);
+            const sStream = this.streamFactory.createSendStream(channel, this.config.minBufferSize);
             stream.pipeTo(sStream.writable).catch(e => console.error(e));
-            streamReadyPromises.push(this.transport.sendReadySignal(id, 'stream'));
+            streamReadyPromises.push(this.transport.sendReadySignal(id, ProtocolHandler.STREAM_LABEL));
         });
         await Promise.all(streamReadyPromises);
 
@@ -426,7 +426,7 @@ export class RTCFetcher {
                         return new ReadableStream({
                             start: (c) => {
                                 const ch = this.getOrOpenChannel(ref.id);
-                                const rs = new ReceiveStream(ch);
+                                const rs = this.streamFactory.createReceiveStream(ch);
                                 rs.readable.pipeTo(new WritableStream({
                                     write: x => c.enqueue(x),
                                     close: () => c.close(),
