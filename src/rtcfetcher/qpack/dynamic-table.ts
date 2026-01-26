@@ -43,6 +43,11 @@ export class DynamicTable {
         return this.insertedCount;
     }
 
+    public getEntries(): DynamicTableEntry[] {
+        // Return a copy to prevent external mutation
+        return [...this.entries];
+    }
+
     public setCapacity(capacity: number) {
         this.capacity = capacity;
         this.evict();

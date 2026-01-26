@@ -2,6 +2,7 @@ import { StreamRef } from '../types/stream-ref';
 
 export interface RTCResponseStats {
     encodedSize: number;
+    requestEncodedSize?: number;
 }
 
 export class RTCResponse {
@@ -25,7 +26,11 @@ export class RTCResponse {
             get: (target, prop, receiver) => {
                 // 1. Priority: Return RTCResponse class members (methods like json, ok, etc.)
                 if (prop in target) {
-                    const value = (target as any)[prop];
+                    if (String(prop) === 'qpackStats') console.log(`[RTCResponse Proxy] Trapped qpackStats`);
+
+                    // Use 'target' as receiver to ensure getters run with the original instance context
+                    // This avoids issues with private properties or recursive proxy traps
+                    const value = Reflect.get(target, prop, target);
                     if (typeof value === 'function') {
                         return value.bind(target);
                     }
@@ -75,6 +80,7 @@ export class RTCResponse {
     }
 
     get qpackStats(): RTCResponseStats | undefined {
+        console.log(`[RTCResponse] Getter qpackStats called. Value:`, this._stats);
         return this._stats;
     }
 

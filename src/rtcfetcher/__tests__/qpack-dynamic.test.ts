@@ -54,10 +54,14 @@ describe('Qpack Dynamic Table', () => {
         context.attachChannels(mockEncoderChannel, mockDecoderChannel);
 
         // Hook up loopback: Encoder Send -> Decoder OnMessage
+        // Since we passed mockEncoderChannel as 'instructionChannel' (1st arg),
+        // QpackContext sends instructions to it AND listens for instructions on it.
+        // So we loop back to itself.
         mockEncoderChannel.send = (data: any) => {
-            if (mockDecoderChannel.onmessage) {
+            if (mockEncoderChannel.onmessage) {
                 // Simulate event
-                mockDecoderChannel.onmessage({ data: data.buffer || data } as MessageEvent);
+                // Use setTimeout to allow async processing if needed, but sync is fine for logic check
+                mockEncoderChannel.onmessage({ data: data.buffer || data } as MessageEvent);
             }
         };
 

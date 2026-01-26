@@ -3,9 +3,11 @@ export class ProtocolHandler {
     private static readonly PREFIX_REQUEST = 'req::';
     private static readonly LABEL_STREAM = 'stream';
     private static readonly LABEL_RES_STREAM = 'res-stream';
+    // Import from constants.ts is tricky due to project structure. Hardcoding for now as it is a protocol constant.
+    private static readonly LABEL_POOLED = '__pooled__';
 
     public static isStreamChannel(label: string): boolean {
-        return label === this.LABEL_STREAM || label === this.LABEL_RES_STREAM;
+        return label === this.LABEL_STREAM || label === this.LABEL_RES_STREAM || label === this.LABEL_POOLED;
     }
 
     public static isRequestChannel(label: string): boolean {

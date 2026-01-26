@@ -22,7 +22,7 @@ export class SendStream {
         }
 
         this.controller.onCredit = (amount) => {
-            // console.debug(`[SendStream] Received credit: ${amount}. Window: ${this.sendWindow} -> ${this.sendWindow + amount}`);
+            console.log(`[SendStream:${this.controller.underlyingChannel.id}] Received credit: ${amount}. Window: ${this.sendWindow} -> ${this.sendWindow + amount}`);
             this.sendWindow += amount;
             this.processPendingWrites();
         };
@@ -96,15 +96,19 @@ export class SendStream {
         }
 
         let offset = 0;
+        console.log(`[SendStream:${this.controller.underlyingChannel.id}] writeChunk called. Size: ${chunk.byteLength}`);
         while (offset < chunk.byteLength) {
             const remaining = chunk.byteLength - offset;
 
             while (this.sendWindow === 0) {
-                // console.debug(`[SendStream] Waiting for credit.`);
+                console.log(`[SendStream:${this.controller.underlyingChannel.id}] Waiting for credit.`);
                 await this.waitForCredit();
+                console.log(`[SendStream:${this.controller.underlyingChannel.id}] Credit received. Window: ${this.sendWindow}`);
             }
 
             const toSendSize = Math.min(remaining, this.sendWindow, this.maxChunkSize);
+            console.log(`[SendStream:${this.controller.underlyingChannel.id}] Sending slice. Offset: ${offset}, Size: ${toSendSize}, Window: ${this.sendWindow} -> ${this.sendWindow - toSendSize}`);
+
             const slice = chunk.subarray(offset, offset + toSendSize);
 
             // Backpressure check (Safety Net)

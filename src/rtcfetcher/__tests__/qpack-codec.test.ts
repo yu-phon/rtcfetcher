@@ -19,13 +19,16 @@ describe('QpackCodec', () => {
     let context: QpackContext;
 
     beforeEach(() => {
-        const encoderStream = new MockChannel();
-        const decoderStream = new MockChannel();
-        encoderStream.peer = decoderStream;
-        decoderStream.peer = encoderStream;
+        // Instruction Channel (ID 1): Loopback for "Encoder -> Decoder" instructions
+        const instructionChannel = new MockChannel();
+        instructionChannel.peer = instructionChannel;
+
+        // Feedback Channel (ID 2): Loopback for "Decoder -> Encoder" feedback (not used in these tests yet)
+        const feedbackChannel = new MockChannel();
+        feedbackChannel.peer = feedbackChannel;
 
         context = new QpackContext();
-        context.attachChannels(encoderStream as any, decoderStream as any);
+        context.attachChannels(instructionChannel as any, feedbackChannel as any);
         codec = new QpackCodec(context);
     });
 

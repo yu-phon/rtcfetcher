@@ -101,6 +101,71 @@
         </div>
     </div>
 
+    <!-- Compression Stats Visualization -->
+    <div class="container" style="margin-top: 20px;">
+        <div class="panel">
+            <div class="section-title">Compression Statistics</div>
+            <div id="statsContainer">
+                <div style="margin-bottom: 20px;">
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
+                        <span>Original Size (JSON)</span>
+                        <span id="statOriginalSize">0 B</span>
+                    </div>
+                    <div style="background: #eee; height: 20px; border-radius: 4px; overflow: hidden;">
+                        <div id="barOriginal" style="background: #ccc; width: 100%; height: 100%;"></div>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 20px;">
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
+                        <span>Encoded Size (QPACK)</span>
+                        <span id="statEncodedSize">0 B</span>
+                    </div>
+                    <div style="background: #eee; height: 20px; border-radius: 4px; overflow: hidden;">
+                        <div id="barEncoded"
+                            style="background: #0078d4; width: 0%; height: 100%; transition: width 0.5s ease;"></div>
+                    </div>
+                </div>
+
+                <div style="text-align: center;">
+                    <div style="font-size: 14px; color: #666;">Compression Ratio</div>
+                    <div id="statRatio" style="font-size: 32px; font-weight: bold; color: #0078d4;">0%</div>
+                    <div id="statSavings" style="font-size: 14px; color: #28a745;">Savings: 0%</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="container" style="margin-top: 20px;">
+        <div class="panel">
+            <div class="section-title">Sender's Dynamic Table (Local Decoder State) <button id="refreshTableBtn">Refresh
+                    Table</button></div>
+            <div id="dynamicTableContainer" style="max-height: 300px; overflow-y: auto;">
+                <table border="1"
+                    style="width: 100%; border-collapse: collapse; font-family: monospace; font-size: 12px;">
+                    <thead>
+                        <tr style="background: #eee;">
+                            <th>Abs Index</th>
+                            <th>Rel Index</th>
+                            <th>Name</th>
+                            <th>Value</th>
+                            <th>Size</th>
+                        </tr>
+                    </thead>
+                    <tbody id="dynamicTableBody">
+                        <tr>
+                            <td colspan="5" style="text-align: center;">Empty</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <div style="margin-top: 10px; font-size: 12px; color: #666;">
+                * This table represents what the Sender (Client) has access to reference.
+                Actually it is the "Local Table" of the Sender's Encoder Context (which mirrors Receiver's Decoder
+                Table).
+            </div>
+        </div>
+    </div>
+
     <script type="module" src="./qpack-test.ts"></script>
 </body>
 

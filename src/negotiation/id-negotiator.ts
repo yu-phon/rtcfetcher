@@ -13,6 +13,9 @@ export class Negotiator {
     // Reservations that are ACKed but waiting for READY from peer
     private waitingForReady: Map<number, { channel?: RTCDataChannel, label?: string, timer?: any }> = new Map();
 
+    // Channels that have been successfully reserved/negotiated and are active.
+    // Used to support Late Binding (re-labeling via READY signal for pooled channels).
+    private activeChannels: Map<number, RTCDataChannel> = new Map();
 
     // Callback when a reservation is acknowledged by the peer (Receiver side)
     // channel is now required because if probe failed, we would have NACKed.
@@ -98,6 +101,13 @@ export class Negotiator {
                 // Keep this channel open to prevent race condition when reusing the ID
                 probeChannel = this.pc.createDataChannel('probe', { negotiated: true, id });
                 console.log(`[Negotiator] Probe created for ID ${id}. State: ${probeChannel.readyState}`);
+
+                // Track active channel
+                this.activeChannels.set(id, probeChannel);
+                probeChannel.addEventListener('close', () => {
+                    this.activeChannels.delete(id);
+                });
+
             } catch (e) {
                 console.warn(`ID ${id} probing failed, marking as used.`, e);
                 isUsed = true;
@@ -119,6 +129,7 @@ export class Negotiator {
                         pending.channel.close();
                     }
                     this.waitingForReady.delete(id);
+                    this.activeChannels.delete(id); // Ensure removed from active list too
                 }
             }, READY_WAIT_TIMEOUT_MS);
 
@@ -133,19 +144,25 @@ export class Negotiator {
     private handleReady(message: NegotiationMessage) {
         const id = message.id;
         const waiting = this.waitingForReady.get(id);
+
+        let channel: RTCDataChannel | undefined;
+        let finalLabel = message.label;
+
         if (waiting) {
+            // Standard Flow: Completed Handshake
             if (waiting.timer) clearTimeout(waiting.timer);
             this.waitingForReady.delete(id);
-            if (this.onReserved && waiting.channel) {
-                // Late Binding: Use label from READY message if provided, otherwise fallback to original label
-                const finalLabel = message.label || waiting.label;
-                this.onReserved(id, waiting.channel, finalLabel);
-            } else if (!waiting.channel) {
-                console.error(`[Negotiator] Unexpected: Ready received but no channel found for ID ${id}`);
-            }
+            channel = waiting.channel;
+            finalLabel = message.label || waiting.label;
         } else {
-            // Received READY for unknown ID? Maybe we already processed it or timeout.
-            // Ignore.
+            // Late Binding Flow: Already reserved, but updating label (e.g. Pooled -> Request)
+            channel = this.activeChannels.get(id);
+        }
+
+        if (channel && this.onReserved) {
+            this.onReserved(id, channel, finalLabel);
+        } else if (!channel) {
+            console.error(`[Negotiator] Unexpected: Ready received but no channel found for ID ${id}`);
         }
     }
 

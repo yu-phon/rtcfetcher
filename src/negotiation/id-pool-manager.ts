@@ -49,12 +49,30 @@ export class IdPoolManager {
      * If the ID was from the pool, returns the pre-created channel.
      * Otherwise, creates a new one.
      */
+    private earlyDataMap: Map<number, MessageEvent[]> = new Map();
+
+    /**
+     * Retrieves a channel for the given ID. 
+     * If the ID was from the pool, returns the pre-created channel.
+     * Otherwise, creates a new one.
+     */
     public getOrCreateChannel(label: string, id: number): RTCDataChannel {
         if (this.pooledChannelMap.has(id)) {
             const channel = this.pooledChannelMap.get(id)!;
             this.pooledChannelMap.delete(id);
-            // Ensure removed from array if logical inconsistency occurred (should be gone via reserveId shift)
-            // Ideally reserveId removes from array, getOrCreate removes from map.
+
+            // Unhook temporary listener
+            channel.onmessage = null;
+
+            // Transfer early data if any
+            const earlyData = this.earlyDataMap.get(id);
+            if (earlyData && earlyData.length > 0) {
+                console.log(`[IdPoolManager] Transferring ${earlyData.length} early packets for ID ${id}`);
+                // @ts-ignore
+                channel.__earlyData = earlyData;
+            }
+            this.earlyDataMap.delete(id);
+
             return channel;
         }
 
@@ -78,6 +96,20 @@ export class IdPoolManager {
 
                 const id = await this.negotiator.reserveId(POOLED_CHANNEL_LABEL, excluded);
                 const channel = this.pc.createDataChannel(POOLED_CHANNEL_LABEL, { negotiated: true, id });
+
+                // Attach temporary listener to buffer early data (e.g. Credits)
+                // IMPORANT: Attach BEFORE sending READY to ensure we don't miss immediate response
+                channel.onmessage = (event) => {
+                    if (!this.earlyDataMap.has(id)) {
+                        this.earlyDataMap.set(id, []);
+                    }
+                    console.log(`[IdPoolManager] Buffering early packet for ID ${id} (${event.data.byteLength || 0} bytes)`);
+                    this.earlyDataMap.get(id)!.push(event);
+                };
+
+                // CRITICAL: Complete handshake so receiver knows it's reserved and keeps it open
+                await this.negotiator.sendReady(id, POOLED_CHANNEL_LABEL);
+
                 console.log(`[IdPoolManager] Created Pooled Channel ID: ${id}`);
 
                 const pooled = { id, channel };

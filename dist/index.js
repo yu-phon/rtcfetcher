@@ -1384,23 +1384,24 @@ var QpackContext = class {
     this.localTable = new DynamicTable(4096);
     this.remoteTable = new DynamicTable(4096);
   }
-  attachChannels(encoderStream, decoderStream) {
-    this.encoderStream = encoderStream;
-    this.decoderStream = decoderStream;
-    this.setupDecoderStreamHandler();
+  attachChannels(instructionChannel, feedbackChannel) {
+    this.instructionChannel = instructionChannel;
+    this.feedbackChannel = feedbackChannel;
+    this.setupInstructionHandler();
+    this.setupFeedbackHandler();
   }
   // Encoder Logic: Insert into dynamic table and send instruction
   insertToDynamicTable(name, value) {
     this.remoteTable.insert(name, value);
-    if (this.encoderStream && this.encoderStream.readyState === "open") {
+    if (this.instructionChannel && this.instructionChannel.readyState === "open") {
       const inst = encodeEncoderInstruction({
         type: "insert_without_name_ref",
         name,
         value
       });
-      this.encoderStream.send(inst);
+      this.instructionChannel.send(inst);
     } else {
-      console.warn("[QPACK] Encoder stream not ready, dynamic insert skipped/queued?");
+      console.warn("[QPACK] Instruction channel not ready, dynamic insert skipped/queued?");
     }
     return this.remoteTable.getInsertedCount() - 1;
   }
@@ -1424,10 +1425,10 @@ var QpackContext = class {
     }
     this.pendingWaiters = remaining;
   }
-  // Decoder Logic: Handle incoming instructions from Remote Encoder
-  setupDecoderStreamHandler() {
-    if (!this.decoderStream) return;
-    this.decoderStream.onmessage = (ev) => {
+  // Decoder Logic: Handle incoming instructions from Remote Encoder on Instruction Channel
+  setupInstructionHandler() {
+    if (!this.instructionChannel) return;
+    this.instructionChannel.onmessage = (ev) => {
       const data = new Uint8Array(ev.data);
       let pos = 0;
       while (pos < data.length) {
@@ -1462,6 +1463,12 @@ var QpackContext = class {
           break;
         }
       }
+    };
+  }
+  // Encoder Logic: Handle incoming feedback from Remote Decoder on Feedback Channel
+  setupFeedbackHandler() {
+    if (!this.feedbackChannel) return;
+    this.feedbackChannel.onmessage = (ev) => {
     };
   }
 };
@@ -1921,9 +1928,7 @@ var RTCResponse = class {
           }
           return value;
         }
-        console.log(`[RTCResponse Proxy] Accessing: ${String(prop)}`);
         const bodyVal = target._body ? target._body[prop] : void 0;
-        console.log(`[RTCResponse Proxy] Value:`, bodyVal);
         return target._wrapValue(bodyVal);
       }
     });
@@ -2104,8 +2109,9 @@ var RTCFetcher = class {
       const pc = pcOrTransport;
       this.transport = new WebRTCTransport(pc, { prefetchPoolSize: this.config.prefetchPoolSize });
       const qpackInstructionStream = this.transport.createChannel("qpack-instructions", 1);
+      const qpackFeedbackStream = this.transport.createChannel("qpack-feedback", 2);
       const qpackContext = new QpackContext();
-      qpackContext.attachChannels(qpackInstructionStream, qpackInstructionStream);
+      qpackContext.attachChannels(qpackInstructionStream, qpackFeedbackStream);
       this.codec = new QpackCodec(qpackContext);
     } else {
       this.transport = pcOrTransport;

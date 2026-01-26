@@ -17,19 +17,22 @@ export class QpackContext {
     public remoteTable: DynamicTable;
 
     // Channels
-    private encoderStream?: RTCDataChannel;
-    private decoderStream?: RTCDataChannel;
+    // ID 1: Instruction Channel (Encoder -> Decoder)
+    private instructionChannel?: RTCDataChannel;
+    // ID 2: Feedback Channel (Decoder -> Encoder)
+    private feedbackChannel?: RTCDataChannel;
 
     constructor() {
         this.localTable = new DynamicTable(4096);
         this.remoteTable = new DynamicTable(4096);
     }
 
-    public attachChannels(encoderStream: RTCDataChannel, decoderStream: RTCDataChannel) {
-        this.encoderStream = encoderStream;
-        this.decoderStream = decoderStream;
-        // console.log(`[QpackContext] Attached Channels. Encoder: ${encoderStream.id}, Decoder: ${decoderStream.id}, ReadyState: ${decoderStream.readyState}`);
-        this.setupDecoderStreamHandler();
+    public attachChannels(instructionChannel: RTCDataChannel, feedbackChannel: RTCDataChannel) {
+        this.instructionChannel = instructionChannel;
+        this.feedbackChannel = feedbackChannel;
+        // console.log(`[QpackContext] Attached Channels. Inst: ${instructionChannel.id}, Feed: ${feedbackChannel.id}`);
+        this.setupInstructionHandler();
+        this.setupFeedbackHandler();
     }
 
     // Encoder Logic: Insert into dynamic table and send instruction
@@ -37,18 +40,17 @@ export class QpackContext {
         // 1. Update our view of Remote Table
         this.remoteTable.insert(name, value);
 
-        // 2. Send Instruction to Remote
-        if (this.encoderStream && this.encoderStream.readyState === 'open') {
+        // 2. Send Instruction to Remote via Instruction Channel
+        if (this.instructionChannel && this.instructionChannel.readyState === 'open') {
             const inst = encodeEncoderInstruction({
                 type: 'insert_without_name_ref',
                 name,
                 value
             });
-            this.encoderStream.send(inst as any);
+            this.instructionChannel.send(inst as any);
         } else {
-            console.warn('[QPACK] Encoder stream not ready, dynamic insert skipped/queued?');
+            console.warn('[QPACK] Instruction channel not ready, dynamic insert skipped/queued?');
             // If we can't send instruction, the remote won't know about this entry.
-            // We should technically queue or fallback to Literal.
         }
 
         // Return Absolute Index
@@ -81,11 +83,11 @@ export class QpackContext {
         this.pendingWaiters = remaining;
     }
 
-    // Decoder Logic: Handle incoming instructions from Remote Encoder
-    private setupDecoderStreamHandler() {
-        if (!this.decoderStream) return;
-        this.decoderStream.onmessage = (ev) => {
-            // console.log(`[QPACK Decoder] Received ${ev.data.byteLength} bytes on stream ${this.decoderStream?.id}`);
+    // Decoder Logic: Handle incoming instructions from Remote Encoder on Instruction Channel
+    private setupInstructionHandler() {
+        if (!this.instructionChannel) return;
+        this.instructionChannel.onmessage = (ev) => {
+            // console.log(`[QPACK Decoder] Received ${ev.data.byteLength} bytes on stream ${this.instructionChannel?.id}`);
             const data = new Uint8Array(ev.data as ArrayBuffer);
             let pos = 0;
             while (pos < data.length) {
@@ -139,6 +141,16 @@ export class QpackContext {
                     break;
                 }
             }
+        };
+    }
+
+    // Encoder Logic: Handle incoming feedback from Remote Decoder on Feedback Channel
+    private setupFeedbackHandler() {
+        if (!this.feedbackChannel) return;
+        this.feedbackChannel.onmessage = (ev) => {
+            // For now, we just drain the channel. 
+            // In full QPACK, we would process Section ACKs here to know what the remote has safely received.
+            // console.log(`[QPACK Encoder] Received Feedback on channel ${this.feedbackChannel?.id}`, ev.data);
         };
     }
 }

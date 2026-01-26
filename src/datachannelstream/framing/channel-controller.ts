@@ -1,19 +1,51 @@
 import { CREDIT_PAYLOAD_SIZE, HEADER_SIZE, MSG_TYPE_CREDIT, MSG_TYPE_DATA } from './constants';
+export { MSG_TYPE_DATA, MSG_TYPE_CREDIT };
 
 export type DataHandler = (data: Uint8Array) => void;
 export type CreditHandler = (amount: number) => void;
 
 export class DataChannelController {
-    public onData?: DataHandler;
+    public _onData?: DataHandler;
     private _onCredit?: CreditHandler;
     private pendingCredit: number = 0;
     private readonly instanceId: string;
+    private incomingBuffer: Uint8Array[] = [];
 
     constructor(private readonly channel: RTCDataChannel) {
         this.instanceId = Math.random().toString(36).substring(7);
-        // console.debug(`[DataChannelController:${this.channel.id}:${this.instanceId}] Created.`);
+        console.log(`[DataChannelController:${this.channel.id}:${this.instanceId}] Created. State: ${this.channel.readyState}`);
         this.channel.binaryType = 'arraybuffer';
         this.channel.onmessage = this.handleMessage.bind(this);
+
+        // Check for early data transferred from IdPoolManager
+        // @ts-ignore
+        if (this.channel.__earlyData && Array.isArray(this.channel.__earlyData)) {
+            // @ts-ignore
+            const earlyData = this.channel.__earlyData as MessageEvent[];
+            console.log(`[DataChannelController:${this.channel.id}:${this.instanceId}] Replaying ${earlyData.length} early packets`);
+            for (const event of earlyData) {
+                this.handleMessage(event);
+            }
+            // @ts-ignore
+            delete this.channel.__earlyData;
+        }
+    }
+
+    set onData(handler: DataHandler | undefined) {
+        this._onData = handler;
+        if (handler) {
+            console.log(`[DataChannelController:${this.channel.id}:${this.instanceId}] Handler attached. Buffered: ${this.incomingBuffer.length}`);
+            // Flush buffered data
+            while (this.incomingBuffer.length > 0) {
+                const data = this.incomingBuffer.shift()!;
+                console.log(`[DataChannelController:${this.channel.id}:${this.instanceId}] Flushing ${data.byteLength} bytes`);
+                handler(data);
+            }
+        }
+    }
+
+    get onData(): DataHandler | undefined {
+        return this._onData;
     }
 
     set onCredit(handler: CreditHandler | undefined) {
@@ -85,6 +117,7 @@ export class DataChannelController {
 
     private handleMessage(event: MessageEvent): void {
         const data = event.data;
+        console.log(`[DataChannelController:${this.channel.id}] Message received: ${data.byteLength} bytes`);
         if (data instanceof ArrayBuffer) {
             this.processBuffer(new Uint8Array(data));
         } else if (data instanceof Uint8Array) {
@@ -97,12 +130,15 @@ export class DataChannelController {
     private processBuffer(buffer: Uint8Array): void {
         if (buffer.byteLength < HEADER_SIZE) return;
         const type = buffer[0];
+        console.log(`[DataChannelController:${this.channel.id}:${this.instanceId}] Processing buffer. Type: ${type}, Size: ${buffer.byteLength}`);
 
         if (type === MSG_TYPE_DATA) {
-            if (this.onData) {
-                this.onData(buffer.subarray(HEADER_SIZE));
+            if (this._onData) {
+                this._onData(buffer.subarray(HEADER_SIZE));
             } else {
-                console.warn(`[DataChannelController:${this.channel.id}:${this.instanceId}] No onData handler! Dropping data.`);
+                // Buffer data until handler is attached
+                console.log(`[DataChannelController:${this.channel.id}:${this.instanceId}] Buffering incoming data (${buffer.byteLength - HEADER_SIZE} bytes)`);
+                this.incomingBuffer.push(buffer.subarray(HEADER_SIZE));
             }
         } else if (type === MSG_TYPE_CREDIT) {
             if (buffer.byteLength < HEADER_SIZE + CREDIT_PAYLOAD_SIZE) return;
@@ -112,7 +148,7 @@ export class DataChannelController {
             if (this._onCredit) {
                 this._onCredit(credit);
             } else {
-                // console.debug(`[DataChannelController:${this.channel.id}:${this.instanceId}] Buffering credit: ${credit}`);
+                console.log(`[DataChannelController:${this.channel.id}:${this.instanceId}] Buffering credit: ${credit}`);
                 this.pendingCredit += credit;
             }
         } else {

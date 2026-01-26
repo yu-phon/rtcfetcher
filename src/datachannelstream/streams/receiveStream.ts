@@ -23,7 +23,7 @@ export class ReceiveStream {
                 const init = () => {
                     // Initial credit grant
                     this.controller.sendCredit(this.initialCredit);
-                    // console.debug(`[ReceiveStream] Sent initial credit: ${this.initialCredit}`);
+                    console.log(`[ReceiveStream:${this.controller.underlyingChannel.id}] Sent initial credit: ${this.initialCredit}`);
 
                     this.controller.onData = (data) => {
                         controller.enqueue(data);

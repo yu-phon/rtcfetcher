@@ -62,22 +62,54 @@ connectBtn.addEventListener('click', async () => {
 
 // Receiver Logic
 (async () => {
+    log(2, "Receiver Loop Started. Waiting for requests...");
     const reader = fetcher2.incomingRequests.getReader();
     while (true) {
+        log(2, "Waiting for reader.read()...");
         const { done, value: req } = await reader.read();
-        if (done) break;
+        if (done) {
+            log(2, "Receiver Loop Ended (Done).");
+            break;
+        }
 
-        const { req: requestData, res } = await req.open();
-        log(2, `Received Request [${req.label}]`, requestData.body);
+        log(2, `Dequeued Request object. Label: ${req.label}. Opening...`);
+        try {
+            const { req: requestData, res } = await req.open();
+            log(2, `OPENED! Body: ${JSON.stringify(requestData.body)}`);
 
-        // Simple echo response with metadata to test response encoding too
-        res.send({
-            echo: true,
-            receivedTimestamp: Date.now(),
-            originalBody: requestData.body
-        });
+            // Simple echo response with metadata to test response encoding too
+            res.send({
+                echo: true,
+                receivedTimestamp: Date.now(),
+                originalBody: requestData.body
+            });
+            log(2, "Response Sent.");
+        } catch (e) {
+            log(2, `Error handling request [${req.label}]: ${e}`);
+            console.error(e);
+        }
     }
 })();
+
+// Helper to update stats after request
+function trackRequestStats(data: any, res: any) {
+    log(1, "[StatsDebug] trackRequestStats called");
+    try {
+        const raw = JSON.stringify(data).length; // Approx
+        // @ts-ignore
+        const stats = res.qpackStats;
+        log(1, `[StatsDebug] res.qpackStats: ${JSON.stringify(stats)}`);
+
+        const enc = stats?.requestEncodedSize || 0;
+        log(1, `[StatsDebug] Raw: ${raw}, Enc: ${enc}`);
+
+        updateStatsUI(raw, enc);
+        updateDynamicTableViz();
+    } catch (e) {
+        log(1, `[StatsDebug] Error: ${e}`);
+        console.error("[StatsDebug] Error in trackRequestStats:", e);
+    }
+}
 
 // Tests
 sendFlatBtn.addEventListener('click', async () => {
@@ -86,6 +118,7 @@ sendFlatBtn.addEventListener('click', async () => {
     const res = await fetcher1.fetch('qpack-flat', data);
     const json = await res.json();
     log(1, 'Response:', json);
+    trackRequestStats(data, res);
 });
 
 sendDeepBtn.addEventListener('click', async () => {
@@ -103,6 +136,7 @@ sendDeepBtn.addEventListener('click', async () => {
     const res = await fetcher1.fetch('qpack-deep', data);
     const json = await res.json();
     log(1, 'Response:', json);
+    trackRequestStats(data, res);
 });
 
 sendArrayBtn.addEventListener('click', async () => {
@@ -115,6 +149,7 @@ sendArrayBtn.addEventListener('click', async () => {
     const res = await fetcher1.fetch('qpack-arr', data);
     const json = await res.json();
     log(1, 'Response:', json);
+    trackRequestStats(data, res);
 });
 
 sendMixedBtn.addEventListener('click', async () => {
@@ -157,6 +192,7 @@ sendMixedBtn.addEventListener('click', async () => {
     } else {
         log(1, 'Failed: payloadStream is not a ReadableStream', receivedStream);
     }
+    trackRequestStats(data, res);
 });
 
 sendRepeatedBtn.addEventListener('click', async () => {
@@ -171,9 +207,10 @@ sendRepeatedBtn.addEventListener('click', async () => {
     const res1 = await fetcher1.fetch('qpack-repeat', data);
     const json1 = await res1.json();
     log(1, 'Response 1:', json1);
+    trackRequestStats(data, res1);
 
     // @ts-ignore
-    const enc1 = res1.qpackStats?.encodedSize || 0;
+    const enc1 = res1.qpackStats?.requestEncodedSize || 0;
     const raw1 = JSON.stringify(data).length; // Approx
     log(1, `Req 1 Stats: Encoded ${enc1} bytes vs Raw JSON ~${raw1} bytes. Ratio: ${(enc1 / raw1).toFixed(2)}`);
 
@@ -183,9 +220,10 @@ sendRepeatedBtn.addEventListener('click', async () => {
     const res2 = await fetcher1.fetch('qpack-repeat', data2);
     const json2 = await res2.json();
     log(1, 'Response 2:', json2);
+    trackRequestStats(data2, res2);
 
     // @ts-ignore
-    const enc2 = res2.qpackStats?.encodedSize || 0;
+    const enc2 = res2.qpackStats?.requestEncodedSize || 0;
     const raw2 = JSON.stringify(data2).length;
     log(1, `Req 2 Stats: Encoded ${enc2} bytes vs Raw JSON ~${raw2} bytes. Ratio: ${(enc2 / raw2).toFixed(2)}`);
 
@@ -197,3 +235,97 @@ sendRepeatedBtn.addEventListener('click', async () => {
 
     log(1, 'If both requests succeeded, Dynamic Table sync is working!');
 });
+
+// Stats UI Logic
+const statOriginalSize = document.getElementById('statOriginalSize') as HTMLSpanElement;
+const statEncodedSize = document.getElementById('statEncodedSize') as HTMLSpanElement;
+const barEncoded = document.getElementById('barEncoded') as HTMLDivElement;
+const statRatio = document.getElementById('statRatio') as HTMLDivElement;
+const statSavings = document.getElementById('statSavings') as HTMLDivElement;
+
+function updateStatsUI(original: number, encoded: number) {
+    statOriginalSize.innerText = `${original} B`;
+    statEncodedSize.innerText = `${encoded} B`;
+
+    // Bar width relative to original (max 100%)
+    // If encoded > original (overhead), cap at 100% or show warning color?
+    // Let's just create a relative bar. 
+    // We treat Original as 100% width reference.
+
+    let percentage = (encoded / original) * 100;
+    if (percentage > 100) percentage = 100; // Cap visual width
+
+    barEncoded.style.width = `${percentage}%`;
+
+    // Ratio: Encoded / Original. (Lower is better)
+    // Savings: (Original - Encoded) / Original. (Higher is better)
+
+    const ratio = (encoded / original).toFixed(2);
+    const savings = ((1 - (encoded / original)) * 100).toFixed(1);
+
+    statRatio.innerText = `${ratio}x`;
+    statSavings.innerText = `Savings: ${savings}%`;
+
+    if (encoded > original) {
+        statSavings.style.color = '#d13438'; // Red if overhead
+        statSavings.innerText = `Overhead: -${savings}%`;
+    } else {
+        statSavings.style.color = '#28a745'; // Green
+    }
+}
+
+// Visualization Logic
+const refreshTableBtn = document.getElementById('refreshTableBtn') as HTMLButtonElement;
+const tableBody = document.getElementById('dynamicTableBody') as HTMLTableSectionElement;
+
+function updateDynamicTableViz() {
+    // Access internal context (Hack/Extension)
+    // @ts-ignore
+    const context = fetcher1.qpackContext;
+    if (!context) {
+        console.warn("No QpackContext found on fetcher1");
+        return;
+    }
+
+    // Access localTable (Encoder's view of the table)
+    // @ts-ignore
+    const table = context.localTable;
+    // @ts-ignore
+    const entries = table.getEntries(); // Use the getter we added
+    // @ts-ignore
+    const dropped = table.droppedCount;
+
+    tableBody.innerHTML = '';
+
+    // Reverse needed because entries are stored Oldest -> Newest
+    // We want to show Newest (Rel 0) at top? Or typically tables show List.
+    // Let's show as is (Oldest first) but with Relative Index calculation.
+    // Actually RFC Rel Index 0 is Newest.
+
+    // entries[0] = Oldest (Abs Index = dropped)
+    // entries[len-1] = Newest (Abs Index = dropped + len - 1) (Rel Index = 0)
+
+    if (entries.length === 0) {
+        tableBody.innerHTML = '<tr><td colspan="5" style="text-align: center;">Empty</td></tr>';
+        return;
+    }
+
+    // Iterate Newest to Oldest for display
+    for (let i = entries.length - 1; i >= 0; i--) {
+        const entry = entries[i];
+        const absIndex = dropped + i;
+        const relIndex = entries.length - 1 - i;
+
+        const row = document.createElement('tr');
+        row.innerHTML = `
+            <td>${absIndex}</td>
+            <td>${relIndex}</td>
+            <td style="word-break: break-all; color: darkblue;">${entry.name}</td>
+            <td style="word-break: break-all;">${entry.value.length > 50 ? entry.value.substring(0, 50) + "..." : entry.value}</td>
+            <td>${entry.size}</td>
+        `;
+        tableBody.appendChild(row);
+    }
+}
+
+refreshTableBtn.addEventListener('click', updateDynamicTableViz);

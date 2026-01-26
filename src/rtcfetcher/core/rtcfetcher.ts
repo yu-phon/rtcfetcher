@@ -40,7 +40,7 @@ export class RTCFetcher {
     private reservedChannels: Map<number, RTCDataChannel> = new Map();
 
     // Pending Queue for Backpressure
-    private pendingChannelQueue: { label: string, channel: RTCDataChannel }[] = [];
+    private pendingChannelQueue: { label: string, controller: DataChannelController }[] = [];
 
     constructor(
         pcOrTransport: RTCPeerConnection | ITransport,
@@ -68,14 +68,18 @@ export class RTCFetcher {
             // ID 2: Decoder Feedback (Bidirectional) - Reserved for future
 
             const qpackInstructionStream = this.transport.createChannel('qpack-instructions', 1);
-            // const qpackFeedbackStream = this.transport.createChannel('qpack-feedback', 2);
+            const qpackFeedbackStream = this.transport.createChannel('qpack-feedback', 2);
 
             const qpackContext = new QpackContext();
 
-            // We attach the SAME channel for both "Encoder Stream" (sending instructions) 
-            // and "Decoder Stream" (receiving instructions) because in our symmetric setup,
-            // ID 1 carries instructions in both directions.
-            qpackContext.attachChannels(qpackInstructionStream, qpackInstructionStream);
+            // WebRTC DataChannels are bidirectional.
+            // ID 1 (qpack-instructions):
+            //   - We write Encoder Instructions to ID 1 (to be read by remote Decoder).
+            //   - We read Remote Encoder Instructions from ID 1 (to update our Local Table).
+            // ID 2 (qpack-feedback):
+            //   - We write Decoder Feedback (ACKs) to ID 2 (to be read by remote Encoder).
+            //   - We read Remote Decoder Feedback from ID 2 (to know what remote has processed).
+            qpackContext.attachChannels(qpackInstructionStream, qpackFeedbackStream);
             this.codec = new QpackCodec(qpackContext);
 
         } else {
@@ -104,6 +108,13 @@ export class RTCFetcher {
         this.opened = this.transport.opened;
     }
 
+    public get qpackContext(): QpackContext | undefined {
+        if (this.codec instanceof QpackCodec) {
+            return this.codec.getContext();
+        }
+        return undefined;
+    }
+
     private handleReservedChannel(id: number, channel: RTCDataChannel, label?: string) {
         try {
             // Check label to distinguish Request Channel vs Stream Channel
@@ -119,8 +130,13 @@ export class RTCFetcher {
 
             console.log(`[RTCFetcher] Handle Req Channel ID: ${id}, Label: ${endpoint}`);
 
+            // Initialize Controller Immediately to start buffering data!
+            // Pooled channels might have data arriving already.
+            const controller = this.streamFactory.createController(channel);
+
             // Queue it (Backpressure)
-            this.pendingChannelQueue.push({ label: endpoint, channel });
+            // We now queue the controller instead of raw channel
+            this.pendingChannelQueue.push({ label: endpoint, controller });
 
             // Pump
             this.pumpIncomingRequests();
@@ -139,18 +155,19 @@ export class RTCFetcher {
             this.pendingChannelQueue.length > 0) {
 
             const item = this.pendingChannelQueue.shift()!;
-            this.createAndEnqueueRequest(item.label, item.channel);
+            this.createAndEnqueueRequest(item.label, item.controller);
         }
     }
 
-    private createAndEnqueueRequest(label: string, channel: RTCDataChannel) {
+    private createAndEnqueueRequest(label: string, controller: DataChannelController) {
+        const channel = controller.underlyingChannel; // For ID access/logging if needed
         const req: IncomingRequest = {
             label: label,
             open: async () => {
                 // LAZY READ START
                 console.log(`[RTCFetcher] Opening Request: ${label} (ID: ${channel.id})`);
 
-                const controller = this.streamFactory.createController(channel);
+                // Controller is already created and buffering.
                 const receiveStream = this.streamFactory.createReceiveStream(controller);
 
                 // Read Body
@@ -184,6 +201,7 @@ export class RTCFetcher {
     }
 
     private async sendResponse(controller: DataChannelController, data: any) {
+        console.log(`[RTCFetcher] sendResponse called for channel ${controller.underlyingChannel.id}`);
         const streams: Map<number, ReadableStream> = new Map();
         // Since we are decoupling transport, we don't manage pre-created channels here as much.
         // We rely on transport.createChannel to give us the right channel.
@@ -204,6 +222,8 @@ export class RTCFetcher {
         });
 
         const encoded = this.codec.encode(processed);
+        console.log(`[RTCFetcher] Encoded response. Size: ${encoded.byteLength}`);
+
         const sendStream = this.streamFactory.createSendStream(controller, this.config.minBufferSize);
 
         // Open stream channels and Signal READY
@@ -221,11 +241,15 @@ export class RTCFetcher {
             const lenBytes = new Uint8Array(4);
             new DataView(lenBytes.buffer).setUint32(0, encoded.byteLength, true);
 
+            console.log(`[RTCFetcher] Writing response length...`);
             await sendStream.write(lenBytes);
+            console.log(`[RTCFetcher] Writing response body...`);
             await sendStream.write(encoded);
+            console.log(`[RTCFetcher] Response written successfully.`);
         } catch (e) {
-            console.error('Error sending response:', e);
+            console.error('[RTCFetcher] Error sending response:', e);
         } finally {
+            console.log(`[RTCFetcher] Closing request channel ${controller.underlyingChannel.id}`);
             controller.close();
         }
     }
@@ -289,14 +313,26 @@ export class RTCFetcher {
         };
 
         try {
+            console.log(`[bufferAndDecode] Reading Header (4 bytes)...`);
             const header = await readExact(4);
-            if (!header) return null;
+            if (!header) {
+                console.warn(`[bufferAndDecode] Failed to read header (EOF)`);
+                return null;
+            }
 
             const len = new DataView(header.buffer).getUint32(0, true);
+            console.log(`[bufferAndDecode] Header read. Body Length: ${len}`);
+
             const bodyBytes = await readExact(len);
-            if (!bodyBytes) return null;
+            if (!bodyBytes) {
+                console.warn(`[bufferAndDecode] Failed to read body (EOF). Expected ${len} bytes.`);
+                return null;
+            }
+            console.log(`[bufferAndDecode] Body read (${bodyBytes.byteLength} bytes). Decoding...`);
 
             const decoded = await this.codec.decode(bodyBytes);
+            console.log(`[bufferAndDecode] Decoded:`, decoded);
+
             if (decoded && typeof decoded === 'object') {
                 return decoded;
             }
@@ -359,11 +395,13 @@ export class RTCFetcher {
             });
         }
 
-        const responseReader = this.streamFactory.createReceiveStream(controller);
         const sendStream = this.streamFactory.createSendStream(controller, this.config.minBufferSize);
 
         // 4. Signal Ready
         await this.transport.sendReadySignal(reservedId, reqLabel);
+
+        // Create ReceiveStream AFTER signaling ready (ensures Server knows about channel before Credit arrives)
+        const responseReader = this.streamFactory.createReceiveStream(controller);
 
         const encoded = this.codec.encode({ label, body: processedBody });
 
@@ -434,7 +472,7 @@ export class RTCFetcher {
                                 }));
                             }
                         });
-                    }, { encodedSize: len }));
+                    }, { encodedSize: len, requestEncodedSize: encoded.byteLength }));
                 } catch (e) {
                     reject(e);
                 } finally {
